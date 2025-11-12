@@ -1,0 +1,68 @@
+name: Manga Scraper
+
+on:
+    workflow_dispatch:
+        inputs:
+            manga_url:
+                description: "Manga URL to scrape"
+                required: true
+                type: string
+            manga_name:
+                description: "Manga name (optional)"
+                required: false
+                type: string
+            operation:
+                description: "Operation to perform"
+                required: true
+                type: choice
+                options:
+                    - scrape_all
+                    - scrape_range
+                    - scrape_single
+                    - verify
+            start_chapter:
+                description: "Start chapter (for range/single)"
+                required: false
+                type: number
+            end_chapter:
+                description: "End chapter (for range only)"
+                required: false
+                type: number
+
+jobs:
+    scrape:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+
+            - name: Install dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install requests beautifulsoup4 supabase
+
+            - name: Run scraper
+              env:
+                  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+                  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+                  MANGA_URL: ${{ inputs.manga_url }}
+                  MANGA_NAME: ${{ inputs.manga_name }}
+                  OPERATION: ${{ inputs.operation }}
+                  START_CHAPTER: ${{ inputs.start_chapter }}
+                  END_CHAPTER: ${{ inputs.end_chapter }}
+              run: |
+                  python scraper_workflow.py
+
+            - name: Upload logs
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: scraper-logs
+                  path: scraper.log
+                  retention-days: 7
