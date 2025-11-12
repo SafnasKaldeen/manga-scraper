@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -7,9 +8,9 @@ import re
 from datetime import datetime
 from supabase import create_client, Client
 
-# Supabase Configuration
-SUPABASE_URL = "https://ppfbpmbomksqlgojwdhr.supabase.co"  # Replace with your Supabase URL
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwZmJwbWJvbWtzcWxnb2p3ZGhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA4NTQ5NDMsImV4cCI6MjA3NjQzMDk0M30.5j7kSkZhoMZgvCGcxdG2phuoN3dwout3JgD1i1cUqaY"  # Replace with your Supabase anon key
+# Supabase Configuration - now from environment variables
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ppfbpmbomksqlgojwdhr.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwZmJwbWJvbWtzcWxnb2p3ZGhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA4NTQ5NDMsImV4cCI6MjA3NjQzMDk0M30.5j7kSkZhoMZgvCGcxdG2phuoN3dwout3JgD1i1cUqaY")
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -110,36 +111,6 @@ def save_manga_to_supabase(manga_name, manga_slug, source_url):
     except Exception as e:
         print(f"✗ Error saving manga to Supabase: {e}")
         raise
-
-
-def create_panels_table_if_not_exists():
-    """
-    Create panels table if it doesn't exist.
-    This should be run once to set up the table.
-    """
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS public.panels (
-        id UUID NOT NULL DEFAULT gen_random_uuid(),
-        chapter_id UUID NULL,
-        panel_number INTEGER NOT NULL,
-        image_url TEXT NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NOW(),
-        CONSTRAINT panels_pkey PRIMARY KEY (id),
-        CONSTRAINT panels_chapter_id_panel_number_key UNIQUE (chapter_id, panel_number),
-        CONSTRAINT panels_chapter_id_fkey FOREIGN KEY (chapter_id) 
-            REFERENCES chapters (id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_panels_chapter 
-        ON public.panels USING btree (chapter_id, panel_number);
-    """
-    
-    try:
-        # Note: Direct SQL execution requires service role key or can be done via Supabase dashboard
-        print("⚠ Please ensure the 'panels' table exists in your Supabase database.")
-        print("You can create it manually using the SQL in the script comments.")
-    except Exception as e:
-        print(f"Note: {e}")
 
 
 def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls):
@@ -432,91 +403,109 @@ def list_all_mangas():
         print(f"✗ Error listing mangas: {e}")
 
 
-if __name__ == "__main__":
+def main():
+    """Main function - supports both interactive and environment variable mode"""
     print("=" * 60)
     print("Manga URL Scraper - Supabase Edition")
     print("=" * 60)
     
-    # Check Supabase configuration
-    if SUPABASE_URL == "your-supabase-url" or SUPABASE_KEY == "your-supabase-anon-key":
-        print("\n⚠ WARNING: Please configure SUPABASE_URL and SUPABASE_KEY in the script!")
-        print("Update the values at the top of the script.\n")
+    # Check if running in GitHub Actions (environment variables mode)
+    manga_url = os.environ.get("MANGA_URL")
+    operation = os.environ.get("OPERATION")
     
-    # Remind about panels table
-    print("\n⚠ IMPORTANT: Make sure the 'panels' table exists in Supabase!")
-    print("Run this SQL in your Supabase SQL editor:")
-    print("""
-CREATE TABLE IF NOT EXISTS public.panels (
-    id UUID NOT NULL DEFAULT gen_random_uuid(),
-    chapter_id UUID NULL,
-    panel_number INTEGER NOT NULL,
-    image_url TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NULL DEFAULT NOW(),
-    CONSTRAINT panels_pkey PRIMARY KEY (id),
-    CONSTRAINT panels_chapter_id_panel_number_key UNIQUE (chapter_id, panel_number),
-    CONSTRAINT panels_chapter_id_fkey FOREIGN KEY (chapter_id) 
-        REFERENCES chapters (id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_panels_chapter 
-    ON public.panels USING btree (chapter_id, panel_number);
-    """)
-    print("=" * 60)
-    
-    # Get manga URL
-    manga_url = input("\nEnter manga URL (e.g., https://www.mangaread.org/manga/one-piece/): ").strip()
-    
-    # Extract manga slug
-    manga_slug = get_manga_slug_from_url(manga_url)
-    
-    if not manga_slug:
-        print("✗ Invalid manga URL format")
-        exit(1)
-    
-    # Get manga name
-    manga_name = input(f"Enter manga name (default: {manga_slug.replace('-', ' ').title()}): ").strip()
-    if not manga_name:
-        manga_name = manga_slug.replace('-', ' ').title()
-    
-    print(f"\nManga: {manga_name}")
-    print(f"Slug: {manga_slug}")
-    
-    print("\nChoose option:")
-    print("1. Scrape all chapters to Supabase")
-    print("2. Scrape specific chapter range")
-    print("3. Scrape single chapter")
-    print("4. Verify manga in Supabase")
-    print("5. List all mangas in database")
-    
-    choice = input("\nEnter choice (1-5): ").strip()
-    
-    try:
-        if choice == "1":
-            confirm = input(f"\n⚠ This will scrape ALL chapters of {manga_name}. Continue? (yes/no): ")
-            if confirm.lower() in ['yes', 'y']:
-                scrape_manga_to_supabase(manga_url, manga_name, manga_slug)
-            else:
-                print("Cancelled.")
+    if manga_url and operation:
+        # GitHub Actions mode
+        print("\n🤖 Running in GitHub Actions mode")
+        print(f"Operation: {operation}")
         
-        elif choice == "2":
-            start = int(input("Enter start chapter number: "))
-            end = int(input("Enter end chapter number: "))
-            scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=start, end_chapter=end)
+        manga_slug = get_manga_slug_from_url(manga_url)
+        if not manga_slug:
+            print("✗ Invalid manga URL format")
+            sys.exit(1)
         
-        elif choice == "3":
-            chapter_num = int(input("Enter chapter number: "))
-            scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=chapter_num, end_chapter=chapter_num)
+        manga_name = os.environ.get("MANGA_NAME") or manga_slug.replace('-', ' ').title()
+        start_chapter = int(os.environ.get("START_CHAPTER", 1))
+        end_chapter = int(os.environ.get("END_CHAPTER", 0)) if os.environ.get("END_CHAPTER") else None
         
-        elif choice == "4":
+        print(f"Manga: {manga_name} ({manga_slug})")
+        print(f"URL: {manga_url}")
+        
+        if operation == "scrape_all":
+            scrape_manga_to_supabase(manga_url, manga_name, manga_slug)
+        elif operation == "scrape_range":
+            scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter, end_chapter)
+        elif operation == "scrape_single":
+            scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter, start_chapter)
+        elif operation == "verify":
             verify_manga_in_supabase(manga_slug)
-        
-        elif choice == "5":
-            list_all_mangas()
-        
         else:
-            print("Invalid choice")
+            print(f"✗ Unknown operation: {operation}")
+            sys.exit(1)
     
-    except KeyboardInterrupt:
-        print("\n\nOperation cancelled by user.")
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
+    else:
+        # Interactive mode
+        print("\n💬 Running in interactive mode")
+        print("\n⚠ IMPORTANT: Make sure the 'panels' table exists in Supabase!")
+        print("=" * 60)
+        
+        # Get manga URL
+        manga_url = input("\nEnter manga URL (e.g., https://www.mangaread.org/manga/one-piece/): ").strip()
+        
+        # Extract manga slug
+        manga_slug = get_manga_slug_from_url(manga_url)
+        
+        if not manga_slug:
+            print("✗ Invalid manga URL format")
+            sys.exit(1)
+        
+        # Get manga name
+        manga_name = input(f"Enter manga name (default: {manga_slug.replace('-', ' ').title()}): ").strip()
+        if not manga_name:
+            manga_name = manga_slug.replace('-', ' ').title()
+        
+        print(f"\nManga: {manga_name}")
+        print(f"Slug: {manga_slug}")
+        
+        print("\nChoose option:")
+        print("1. Scrape all chapters to Supabase")
+        print("2. Scrape specific chapter range")
+        print("3. Scrape single chapter")
+        print("4. Verify manga in Supabase")
+        print("5. List all mangas in database")
+        
+        choice = input("\nEnter choice (1-5): ").strip()
+        
+        try:
+            if choice == "1":
+                confirm = input(f"\n⚠ This will scrape ALL chapters of {manga_name}. Continue? (yes/no): ")
+                if confirm.lower() in ['yes', 'y']:
+                    scrape_manga_to_supabase(manga_url, manga_name, manga_slug)
+                else:
+                    print("Cancelled.")
+            
+            elif choice == "2":
+                start = int(input("Enter start chapter number: "))
+                end = int(input("Enter end chapter number: "))
+                scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=start, end_chapter=end)
+            
+            elif choice == "3":
+                chapter_num = int(input("Enter chapter number: "))
+                scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=chapter_num, end_chapter=chapter_num)
+            
+            elif choice == "4":
+                verify_manga_in_supabase(manga_slug)
+            
+            elif choice == "5":
+                list_all_mangas()
+            
+            else:
+                print("Invalid choice")
+        
+        except KeyboardInterrupt:
+            print("\n\nOperation cancelled by user.")
+        except Exception as e:
+            print(f"\n✗ Error: {e}")
+
+
+if __name__ == "__main__":
+    main()

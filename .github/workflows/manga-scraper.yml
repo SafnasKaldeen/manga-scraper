@@ -8,7 +8,7 @@ on:
                 required: true
                 type: string
             manga_name:
-                description: "Manga name (optional)"
+                description: "Manga name (optional - auto-detected from URL if empty)"
                 required: false
                 type: string
             operation:
@@ -20,10 +20,12 @@ on:
                     - scrape_range
                     - scrape_single
                     - verify
+                default: scrape_all
             start_chapter:
                 description: "Start chapter (for range/single)"
                 required: false
                 type: number
+                default: 1
             end_chapter:
                 description: "End chapter (for range only)"
                 required: false
@@ -51,18 +53,21 @@ jobs:
               env:
                   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
                   SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-                  MANGA_URL: ${{ inputs.manga_url }}
-                  MANGA_NAME: ${{ inputs.manga_name }}
-                  OPERATION: ${{ inputs.operation }}
-                  START_CHAPTER: ${{ inputs.start_chapter }}
-                  END_CHAPTER: ${{ inputs.end_chapter }}
+                  MANGA_URL: ${{ github.event.inputs.manga_url }}
+                  MANGA_NAME: ${{ github.event.inputs.manga_name }}
+                  OPERATION: ${{ github.event.inputs.operation }}
+                  START_CHAPTER: ${{ github.event.inputs.start_chapter }}
+                  END_CHAPTER: ${{ github.event.inputs.end_chapter }}
               run: |
                   python scraper_workflow.py
 
-            - name: Upload logs
+            - name: Upload logs (if any)
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: scraper-logs
-                  path: scraper.log
+                  name: scraper-logs-${{ github.run_number }}
+                  path: |
+                      *.log
+                      scraper.log
                   retention-days: 7
+              continue-on-error: true
