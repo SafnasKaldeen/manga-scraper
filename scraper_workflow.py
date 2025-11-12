@@ -8,9 +8,13 @@ import re
 from datetime import datetime
 from supabase import create_client, Client
 
-# Supabase Configuration - now from environment variables
+# Supabase Configuration
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ppfbpmbomksqlgojwdhr.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwZmJwbWJvbWtzcWxnb2p3ZGhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA4NTQ5NDMsImV4cCI6MjA3NjQzMDk0M30.5j7kSkZhoMZgvCGcxdG2phuoN3dwout3JgD1i1cUqaY")
+
+if not SUPABASE_KEY:
+    print("✗ Error: SUPABASE_KEY environment variable must be set")
+    sys.exit(1)
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -116,10 +120,15 @@ def save_manga_to_supabase(manga_name, manga_slug, source_url):
 def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls):
     """
     Save chapter and its panels to Supabase.
+    Handles decimal chapter numbers (e.g., 100.5).
     Returns: (chapter_id, success)
     """
     try:
-        # Check if chapter exists
+        # Convert chapter_number to float if it's a string
+        if isinstance(chapter_number, str):
+            chapter_number = float(chapter_number)
+        
+        # Check if chapter exists - use numeric comparison for decimal chapters
         existing = supabase.table('chapters').select('id').eq('manga_id', manga_id).eq('chapter_number', chapter_number).execute()
         
         if existing.data:
@@ -218,16 +227,21 @@ def get_all_chapters(manga_url):
         for link in links:
             href = link.get('href')
             if href and '/chapter-' in href:
-                # Extract chapter number
-                match = re.search(r'chapter-(\d+)', href)
+                # Extract chapter number (supports decimals like 100.5)
+                match = re.search(r'chapter-([\d.]+)', href)
                 if match:
-                    chapter_num = int(match.group(1))
-                    full_url = urljoin(manga_url, href)
-                    chapter_links.append({
-                        'url': full_url,
-                        'number': chapter_num,
-                        'text': link.get_text(strip=True)
-                    })
+                    chapter_num_str = match.group(1)
+                    try:
+                        chapter_num = float(chapter_num_str)
+                        full_url = urljoin(manga_url, href)
+                        chapter_links.append({
+                            'url': full_url,
+                            'number': chapter_num,
+                            'text': link.get_text(strip=True)
+                        })
+                    except ValueError:
+                        print(f"  ⚠ Skipping invalid chapter number: {chapter_num_str}")
+                        continue
         
         # Remove duplicates and sort by chapter number
         unique_chapters = {ch['number']: ch for ch in chapter_links}
@@ -245,9 +259,10 @@ def get_all_chapters(manga_url):
         return []
 
 
-def scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=1, end_chapter=None):
+def scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=1, end_chapter=None, max_retries=3):
     """
     Scrape manga chapters and save URLs to Supabase.
+    Automatically retries failed chapters.
     """
     print(f"\n{'='*60}")
     print(f"SCRAPING MANGA TO SUPABASE")
@@ -282,6 +297,7 @@ def scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=1,
     success_count = 0
     failed_chapters = []
     
+    # First pass: scrape all chapters
     for idx, chapter in enumerate(chapters, 1):
         chapter_num = chapter['number']
         chapter_url = chapter['url']
@@ -305,10 +321,10 @@ def scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=1,
                     success_count += 1
                     print(f"  ✓ Chapter {chapter_num} saved successfully!")
                 else:
-                    failed_chapters.append(chapter_num)
+                    failed_chapters.append(chapter)
             else:
                 print(f"  ✗ Failed to scrape: {error}")
-                failed_chapters.append(chapter_num)
+                failed_chapters.append(chapter)
             
             # Be polite to the server
             time.sleep(2)
@@ -318,7 +334,58 @@ def scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=1,
             break
         except Exception as e:
             print(f"  ✗ Error processing chapter {chapter_num}: {e}")
-            failed_chapters.append(chapter_num)
+            failed_chapters.append(chapter)
+    
+    # Retry failed chapters
+    retry_count = 0
+    while failed_chapters and retry_count < max_retries:
+        retry_count += 1
+        print(f"\n{'='*60}")
+        print(f"RETRY ATTEMPT {retry_count}/{max_retries}")
+        print(f"Retrying {len(failed_chapters)} failed chapters")
+        print(f"{'='*60}\n")
+        
+        still_failed = []
+        
+        for idx, chapter in enumerate(failed_chapters, 1):
+            chapter_num = chapter['number']
+            chapter_url = chapter['url']
+            chapter_title = chapter['text']
+            
+            print(f"\n[Retry {idx}/{len(failed_chapters)}] {'='*40}")
+            print(f"Chapter {chapter_num}: {chapter_title}")
+            print(f"{'='*60}")
+            
+            try:
+                # Scrape image URLs
+                image_urls, success, error = scrape_chapter_urls(chapter_url)
+                
+                if success and image_urls:
+                    # Save to Supabase
+                    chapter_id, saved = save_chapter_to_supabase(
+                        manga_id, chapter_num, chapter_title, image_urls
+                    )
+                    
+                    if saved:
+                        success_count += 1
+                        print(f"  ✓ Chapter {chapter_num} saved successfully on retry!")
+                    else:
+                        still_failed.append(chapter)
+                else:
+                    print(f"  ✗ Still failed: {error}")
+                    still_failed.append(chapter)
+                
+                # Be polite to the server
+                time.sleep(3)  # Longer delay for retries
+                
+            except KeyboardInterrupt:
+                print("\n\n⚠ Retry interrupted by user")
+                break
+            except Exception as e:
+                print(f"  ✗ Error on retry: {e}")
+                still_failed.append(chapter)
+        
+        failed_chapters = still_failed
     
     # Summary
     print(f"\n{'='*60}")
@@ -326,8 +393,12 @@ def scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=1,
     print(f"{'='*60}")
     print(f"✓ Successfully saved: {success_count}/{len(chapters)} chapters")
     if failed_chapters:
-        print(f"✗ Failed chapters: {', '.join(map(str, failed_chapters))}")
-    print(f"Manga ID: {manga_id}")
+        print(f"\n✗ Failed chapters after {retry_count} retries:")
+        for ch in failed_chapters:
+            print(f"   - Chapter {ch['number']}: {ch['text']}")
+    else:
+        print(f"\n🎉 All chapters scraped successfully!")
+    print(f"\nManga ID: {manga_id}")
     print(f"{'='*60}\n")
 
 
@@ -379,57 +450,62 @@ def verify_manga_in_supabase(manga_slug):
         print(f"✗ Error verifying manga: {e}")
 
 
-def list_all_mangas():
-    """List all mangas in the database"""
-    try:
-        mangas = supabase.table('mangas').select('*').order('created_at', desc=True).execute()
-        
-        if not mangas.data:
-            print("No mangas found in database.")
-            return
-        
-        print(f"\n{'='*60}")
-        print(f"ALL MANGAS ({len(mangas.data)} total)")
-        print(f"{'='*60}\n")
-        
-        for manga in mangas.data:
-            print(f"📚 {manga['title']}")
-            print(f"   Slug: {manga['slug']}")
-            print(f"   Chapters: {manga.get('total_chapters', 0)} | Panels: {manga.get('total_panels', 0)}")
-            print(f"   Status: {manga.get('status', 'N/A')}")
-            print()
-        
-    except Exception as e:
-        print(f"✗ Error listing mangas: {e}")
-
-
 def main():
-    """Main function - supports both interactive and environment variable mode"""
+    """Main function - GitHub Actions mode only"""
     print("=" * 60)
     print("Manga URL Scraper - Supabase Edition")
     print("=" * 60)
     
-    # Check if running in GitHub Actions (environment variables mode)
+    # Get environment variables
     manga_url = os.environ.get("MANGA_URL")
     operation = os.environ.get("OPERATION")
     
-    if manga_url and operation:
-        # GitHub Actions mode
-        print("\n🤖 Running in GitHub Actions mode")
-        print(f"Operation: {operation}")
-        
-        manga_slug = get_manga_slug_from_url(manga_url)
-        if not manga_slug:
-            print("✗ Invalid manga URL format")
-            sys.exit(1)
-        
-        manga_name = os.environ.get("MANGA_NAME") or manga_slug.replace('-', ' ').title()
-        start_chapter = int(os.environ.get("START_CHAPTER", 1))
-        end_chapter = int(os.environ.get("END_CHAPTER", 0)) if os.environ.get("END_CHAPTER") else None
-        
-        print(f"Manga: {manga_name} ({manga_slug})")
-        print(f"URL: {manga_url}")
-        
+    if not manga_url or not operation:
+        print("\n✗ Error: MANGA_URL and OPERATION environment variables are required")
+        print("This script is designed to run in GitHub Actions.")
+        print("\nRequired environment variables:")
+        print("  - MANGA_URL: The manga URL to scrape")
+        print("  - OPERATION: scrape_all, scrape_range, scrape_single, or verify")
+        print("  - START_CHAPTER: (optional) Starting chapter number")
+        print("  - END_CHAPTER: (optional) Ending chapter number")
+        print("  - MANGA_NAME: (optional) Manga name")
+        sys.exit(1)
+    
+    # GitHub Actions mode
+    print(f"\n🤖 Running in GitHub Actions mode")
+    print(f"Operation: {operation}")
+    
+    manga_slug = get_manga_slug_from_url(manga_url)
+    if not manga_slug:
+        print("✗ Invalid manga URL format")
+        print("URL should be like: https://www.mangaread.org/manga/one-piece/")
+        sys.exit(1)
+    
+    manga_name = os.environ.get("MANGA_NAME") or manga_slug.replace('-', ' ').title()
+    
+    # Handle start_chapter as float
+    start_chapter_str = os.environ.get("START_CHAPTER", "1")
+    try:
+        start_chapter = float(start_chapter_str)
+    except ValueError:
+        start_chapter = 1.0
+    
+    # Handle end_chapter as float
+    end_chapter_str = os.environ.get("END_CHAPTER")
+    end_chapter = None
+    if end_chapter_str and end_chapter_str.strip():
+        try:
+            end_chapter = float(end_chapter_str)
+        except ValueError:
+            end_chapter = None
+    
+    print(f"Manga: {manga_name} ({manga_slug})")
+    print(f"URL: {manga_url}")
+    if operation in ['scrape_range', 'scrape_single']:
+        print(f"Chapter range: {start_chapter} to {end_chapter or 'end'}")
+    print("=" * 60)
+    
+    try:
         if operation == "scrape_all":
             scrape_manga_to_supabase(manga_url, manga_name, manga_slug)
         elif operation == "scrape_range":
@@ -440,71 +516,16 @@ def main():
             verify_manga_in_supabase(manga_slug)
         else:
             print(f"✗ Unknown operation: {operation}")
-            sys.exit(1)
-    
-    else:
-        # Interactive mode
-        print("\n💬 Running in interactive mode")
-        print("\n⚠ IMPORTANT: Make sure the 'panels' table exists in Supabase!")
-        print("=" * 60)
-        
-        # Get manga URL
-        manga_url = input("\nEnter manga URL (e.g., https://www.mangaread.org/manga/one-piece/): ").strip()
-        
-        # Extract manga slug
-        manga_slug = get_manga_slug_from_url(manga_url)
-        
-        if not manga_slug:
-            print("✗ Invalid manga URL format")
+            print("Valid operations: scrape_all, scrape_range, scrape_single, verify")
             sys.exit(1)
         
-        # Get manga name
-        manga_name = input(f"Enter manga name (default: {manga_slug.replace('-', ' ').title()}): ").strip()
-        if not manga_name:
-            manga_name = manga_slug.replace('-', ' ').title()
+        print("\n✓ Script completed successfully")
         
-        print(f"\nManga: {manga_name}")
-        print(f"Slug: {manga_slug}")
-        
-        print("\nChoose option:")
-        print("1. Scrape all chapters to Supabase")
-        print("2. Scrape specific chapter range")
-        print("3. Scrape single chapter")
-        print("4. Verify manga in Supabase")
-        print("5. List all mangas in database")
-        
-        choice = input("\nEnter choice (1-5): ").strip()
-        
-        try:
-            if choice == "1":
-                confirm = input(f"\n⚠ This will scrape ALL chapters of {manga_name}. Continue? (yes/no): ")
-                if confirm.lower() in ['yes', 'y']:
-                    scrape_manga_to_supabase(manga_url, manga_name, manga_slug)
-                else:
-                    print("Cancelled.")
-            
-            elif choice == "2":
-                start = int(input("Enter start chapter number: "))
-                end = int(input("Enter end chapter number: "))
-                scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=start, end_chapter=end)
-            
-            elif choice == "3":
-                chapter_num = int(input("Enter chapter number: "))
-                scrape_manga_to_supabase(manga_url, manga_name, manga_slug, start_chapter=chapter_num, end_chapter=chapter_num)
-            
-            elif choice == "4":
-                verify_manga_in_supabase(manga_slug)
-            
-            elif choice == "5":
-                list_all_mangas()
-            
-            else:
-                print("Invalid choice")
-        
-        except KeyboardInterrupt:
-            print("\n\nOperation cancelled by user.")
-        except Exception as e:
-            print(f"\n✗ Error: {e}")
+    except Exception as e:
+        print(f"\n✗ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
