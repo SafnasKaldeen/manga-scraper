@@ -12,6 +12,7 @@ from supabase import create_client, Client
 SUPABASE_URL = "https://ppfbpmbomksqlgojwdhr.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBwZmJwbWJvbWtzcWxnb2p3ZGhyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA4NTQ5NDMsImV4cCI6MjA3NjQzMDk0M30.5j7kSkZhoMZgvCGcxdG2phuoN3dwout3JgD1i1cUqaY"
 
+
 if not SUPABASE_KEY:
     print("✗ Error: SUPABASE_KEY environment variable must be set")
     sys.exit(1)
@@ -124,9 +125,14 @@ def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls
     Returns: (chapter_id, success)
     """
     try:
-        # Convert chapter_number to float if it's a string
+        # Convert chapter_number to appropriate type
         if isinstance(chapter_number, str):
             chapter_number = float(chapter_number)
+        
+        # Convert to int if it's a whole number (e.g., 15.0 -> 15)
+        # This avoids issues with bigint columns in Supabase
+        if isinstance(chapter_number, float) and chapter_number.is_integer():
+            chapter_number = int(chapter_number)
         
         # Check if chapter exists - use numeric comparison for decimal chapters
         existing = supabase.table('chapters').select('id').eq('manga_id', manga_id).eq('chapter_number', chapter_number).execute()
