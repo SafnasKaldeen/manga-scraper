@@ -333,86 +333,140 @@ def scrape_google_news(query="anime", max_articles=20, scroll_attempts=5, sort_b
     return results
 
 
+def scrape_multiple_queries(queries, max_articles_per_query=50, scroll_attempts=20, sort_by_time=True, supabase_client=None, table_name="news_articles"):
+    """
+    Scrape multiple queries sequentially
+    
+    Args:
+        queries: List of search query strings
+        max_articles_per_query: Maximum articles to scrape per query
+        scroll_attempts: Number of scroll attempts per query
+        sort_by_time: Sort by time (newest first)
+        supabase_client: Supabase client instance
+        table_name: Supabase table name
+    
+    Returns:
+        Dictionary with query as key and stats as value
+    """
+    all_stats = {}
+    
+    for query in queries:
+        print("\n" + "="*80)
+        print(f"🔍 STARTING SCRAPE FOR: {query.upper()}")
+        print("="*80 + "\n")
+        
+        # Scrape articles for this query
+        articles = scrape_google_news(
+            query=query,
+            max_articles=max_articles_per_query,
+            scroll_attempts=scroll_attempts,
+            sort_by_time=sort_by_time,
+            supabase_client=supabase_client
+        )
+        
+        print("\n" + "="*80)
+        print(f"📊 SCRAPED {len(articles)} ARTICLES FOR '{query}'")
+        print("="*80 + "\n")
+        
+        # Upload to Supabase
+        if supabase_client and articles:
+            print(f"📤 UPLOADING '{query}' ARTICLES TO SUPABASE\n")
+            uploaded, skipped, errors = upload_to_supabase(supabase_client, articles, table_name)
+            
+            all_stats[query] = {
+                'scraped': len(articles),
+                'uploaded': uploaded,
+                'skipped': skipped,
+                'errors': errors
+            }
+            
+            print("\n" + "-"*80)
+            print(f"✨ '{query}' UPLOAD SUMMARY")
+            print("-"*80)
+            print(f"✅ Uploaded: {uploaded}")
+            print(f"⏭️  Skipped: {skipped}")
+            print(f"❌ Errors: {errors}")
+            print(f"📦 Total: {len(articles)}")
+            print("-"*80)
+        else:
+            all_stats[query] = {
+                'scraped': len(articles),
+                'uploaded': 0,
+                'skipped': 0,
+                'errors': 0
+            }
+        
+        # Wait between queries to be polite
+        if query != queries[-1]:  # Don't wait after last query
+            print(f"\n⏳ Waiting 5 seconds before next query...\n")
+            time.sleep(5)
+    
+    return all_stats
+
+
 if __name__ == "__main__":
-    # Customize these parameters
-    SEARCH_QUERY = "anime"
-    MAX_ARTICLES = 50
+    # Configuration
+    QUERIES = ["anime", "manga"]  # List of queries to scrape
+    MAX_ARTICLES_PER_QUERY = 50
     SCROLL_ATTEMPTS = 20
-    SORT_BY_TIME = True  # Set to True for newest first, False for Google's default order
+    SORT_BY_TIME = True
     TABLE_NAME = "news_articles"
     
-    print(f"🚀 Starting Google News Scraper")
-    print(f"Query: '{SEARCH_QUERY}'")
-    print(f"Target: {MAX_ARTICLES} articles")
+    print("🚀 Starting Multi-Query Google News Scraper")
+    print(f"Queries: {', '.join(QUERIES)}")
+    print(f"Target per query: {MAX_ARTICLES_PER_QUERY} articles")
     print(f"Scroll attempts: {SCROLL_ATTEMPTS}")
     print(f"Sort by time: {'✅ Yes (newest first)' if SORT_BY_TIME else '❌ No (Google default)'}\n")
-    print("="*80 + "\n")
     
-    # Initialize Supabase client first
+    # Initialize Supabase client
     try:
         supabase = init_supabase()
         print("✅ Connected to Supabase\n")
     except Exception as e:
-        print(f"⚠️  Could not connect to Supabase: {e}")
-        print("Continuing without duplicate checking...\n")
-        supabase = None
-    
-    # Scrape articles (with duplicate checking if Supabase is available)
-    articles = scrape_google_news(
-        query=SEARCH_QUERY,
-        max_articles=MAX_ARTICLES,
-        scroll_attempts=SCROLL_ATTEMPTS,
-        sort_by_time=SORT_BY_TIME,
-        supabase_client=supabase
-    )
-    
-    print("\n" + "="*80)
-    print(f"📊 SCRAPED {len(articles)} ARTICLES")
-    print("="*80 + "\n")
-    
-    # Display summary (already sorted by time if enabled)
-    for i, article in enumerate(articles, 1):
-        print(f"{i}. {article['title']}")
-        print(f"   Publisher: {article['publisher']}")
-        print(f"   Published: {article['published_text'] or 'Unknown'}")
-        if article['published_datetime']:
-            print(f"   DateTime: {article['published_datetime'].strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"   URL: {article['real_url']}")
-        print(f"   Image: {'✅ Yes' if article['image'] else '❌ No'}")
-        print("-" * 80)
-    
-    # Upload to Supabase
-    print("\n" + "="*80)
-    print("📤 UPLOADING TO SUPABASE")
-    print("="*80 + "\n")
-    
-    if not supabase:
-        try:
-            supabase = init_supabase()
-        except Exception as e:
-            print(f"\n❌ Error connecting to Supabase: {e}")
-            print("\nMake sure you have:")
-            print("1. Created a .env file with SUPABASE_URL and SUPABASE_KEY")
-            print("2. Installed required packages: pip install supabase python-dotenv")
-            print("3. Created the table in Supabase")
-            exit(1)
-    
-    try:
-        uploaded, skipped, errors = upload_to_supabase(supabase, articles, TABLE_NAME)
-        
-        print("\n" + "="*80)
-        print("✨ UPLOAD SUMMARY")
-        print("="*80)
-        print(f"✅ Uploaded: {uploaded}")
-        print(f"⏭️  Skipped (already exists): {skipped}")
-        print(f"❌ Errors: {errors}")
-        print(f"📦 Total processed: {len(articles)}")
-        print(f"⏰ TTL: 7 days (expires on {(datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')})")
-        print("="*80)
-        
-    except Exception as e:
-        print(f"\n❌ Error connecting to Supabase: {e}")
+        print(f"❌ Error connecting to Supabase: {e}")
         print("\nMake sure you have:")
         print("1. Created a .env file with SUPABASE_URL and SUPABASE_KEY")
         print("2. Installed required packages: pip install supabase python-dotenv")
         print("3. Created the table in Supabase")
+        exit(1)
+    
+    # Scrape all queries
+    stats = scrape_multiple_queries(
+        queries=QUERIES,
+        max_articles_per_query=MAX_ARTICLES_PER_QUERY,
+        scroll_attempts=SCROLL_ATTEMPTS,
+        sort_by_time=SORT_BY_TIME,
+        supabase_client=supabase,
+        table_name=TABLE_NAME
+    )
+    
+    # Final summary
+    print("\n\n" + "="*80)
+    print("🎉 FINAL SUMMARY - ALL QUERIES")
+    print("="*80)
+    
+    total_scraped = 0
+    total_uploaded = 0
+    total_skipped = 0
+    total_errors = 0
+    
+    for query, data in stats.items():
+        print(f"\n📰 {query.upper()}:")
+        print(f"   Scraped: {data['scraped']}")
+        print(f"   Uploaded: {data['uploaded']}")
+        print(f"   Skipped: {data['skipped']}")
+        print(f"   Errors: {data['errors']}")
+        
+        total_scraped += data['scraped']
+        total_uploaded += data['uploaded']
+        total_skipped += data['skipped']
+        total_errors += data['errors']
+    
+    print("\n" + "-"*80)
+    print("📊 TOTALS:")
+    print(f"   Total Scraped: {total_scraped}")
+    print(f"   Total Uploaded: {total_uploaded}")
+    print(f"   Total Skipped: {total_skipped}")
+    print(f"   Total Errors: {total_errors}")
+    print(f"   ⏰ TTL: 7 days (expires on {(datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')})")
+    print("="*80)
