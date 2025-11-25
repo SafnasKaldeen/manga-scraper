@@ -1,73 +1,50 @@
-name: Manga Scraper
-
+name: Auto Update All Mangas
 on:
+    # Run every 3 hours
+    schedule:
+        - cron: "0 */3 * * *"
+    
+    # Allow manual trigger
     workflow_dispatch:
         inputs:
-            manga_url:
-                description: "Manga URL to scrape"
-                required: true
-                type: string
-            manga_name:
-                description: "Manga name (optional - auto-detected from URL if empty)"
+            force_update:
+                description: "Force update all chapters (ignore existing)"
                 required: false
-                type: string
-            operation:
-                description: "Operation to perform"
-                required: true
-                type: choice
-                options:
-                    - scrape_all
-                    - scrape_range
-                    - scrape_single
-                    - verify
-                default: scrape_all
-            start_chapter:
-                description: "Start chapter (for range/single)"
-                required: false
-                type: number
-                default: 1
-            end_chapter:
-                description: "End chapter (for range only)"
-                required: false
-                type: number
+                type: boolean
+                default: false
 
 jobs:
-    scrape:
+    update-mangas:
         runs-on: ubuntu-latest
-
         steps:
             - name: Checkout repository
               uses: actions/checkout@v4
-
+            
             - name: Set up Python
               uses: actions/setup-python@v5
               with:
                   python-version: "3.11"
-
+            
             - name: Install dependencies
               run: |
                   python -m pip install --upgrade pip
                   pip install requests beautifulsoup4 supabase
-
-            - name: Run scraper
+            
+            - name: Run auto updater
               env:
                   SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
                   SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-                  MANGA_URL: ${{ github.event.inputs.manga_url }}
-                  MANGA_NAME: ${{ github.event.inputs.manga_name }}
-                  OPERATION: ${{ github.event.inputs.operation }}
-                  START_CHAPTER: ${{ github.event.inputs.start_chapter }}
-                  END_CHAPTER: ${{ github.event.inputs.end_chapter }}
+                  FORCE_UPDATE: ${{ github.event.inputs.force_update || 'false' }}
               run: |
-                  python scraper_workflow.py
-
-            - name: Upload logs (if any)
+                  python auto_updater.py
+            
+            - name: Upload update logs
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: scraper-logs-${{ github.run_number }}
+                  name: update-logs-${{ github.run_number }}
                   path: |
-                      *.log
-                      scraper.log
-                  retention-days: 7
+                      update_*.log
+                      auto_updater.log
+                  retention-days: 30
               continue-on-error: true
