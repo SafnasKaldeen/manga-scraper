@@ -43,20 +43,55 @@ def get_all_mangas_from_supabase():
 
 
 def get_existing_chapters_from_supabase(manga_id):
-    """Get list of existing chapter numbers for a manga"""
+    """
+    Get all existing chapter numbers for a manga.
+    If the manga has < 900 chapters, fetch all at once.
+    If >= 900, paginate in batches of 1000 to avoid Supabase limit.
+    """
+    existing = set()
+    
     try:
-        result = supabase.table('chapters').select('chapter_number').eq('manga_id', manga_id).execute()
-        # Convert to set of floats for easy comparison
-        existing = set()
-        for ch in result.data:
-            num = ch['chapter_number']
-            # Handle both int and float chapter numbers
-            if isinstance(num, (int, float)):
-                existing.add(float(num))
-        return existing
+        # First, fetch total chapters count for this manga
+        manga_result = supabase.table("mangas").select("total_chapters").eq("id", manga_id).single().execute()
+        total_chapters = manga_result.data.get("total_chapters", 0) if manga_result.data else 0
+        
+        # If manga has fewer than 900 chapters, fetch all at once
+        if total_chapters < 900:
+            result = supabase.table("chapters").select("chapter_number").eq("manga_id", manga_id).execute()
+            for ch in result.data:
+                num = ch["chapter_number"]
+                if isinstance(num, (int, float)):
+                    existing.add(float(num))
+        else:
+            # Paginate in batches of 1000
+            BATCH_SIZE = 1000
+            start = 0
+            while True:
+                result = (
+                    supabase.table("chapters")
+                    .select("chapter_number")
+                    .eq("manga_id", manga_id)
+                    .range(start, start + BATCH_SIZE - 1)
+                    .execute()
+                )
+                data = result.data
+                if not data:
+                    break
+
+                for ch in data:
+                    num = ch["chapter_number"]
+                    if isinstance(num, (int, float)):
+                        existing.add(float(num))
+
+                if len(data) < BATCH_SIZE:
+                    break
+
+                start += BATCH_SIZE
+
     except Exception as e:
         log_message(f"Error fetching existing chapters: {e}", "ERROR")
-        return set()
+    
+    return existing
 
 
 def get_available_chapters_from_source(manga_slug):
