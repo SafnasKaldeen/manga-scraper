@@ -1,8 +1,8 @@
 name: Auto Update All Mangas
 on:
-    # Run every 3 hours
+    # Run every 1 hours
     schedule:
-        - cron: "0 */3 * * *"
+        - cron: "0 */1 * * *"
     
     # Allow manual trigger
     workflow_dispatch:
