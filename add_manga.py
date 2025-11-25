@@ -2,7 +2,7 @@ import os
 import sys
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 import time
 import re
 from datetime import datetime
@@ -60,7 +60,7 @@ def get_existing_chapters_from_supabase(manga_id):
 
 
 def get_available_chapters_from_source(manga_slug):
-    """Scrape available chapters from mangaread.org"""
+    """Scrape available chapters from mangaread.org with smart pagination"""
     manga_url = f"{MANGA_BASE_URL}{manga_slug}/"
     
     headers = {
@@ -68,44 +68,92 @@ def get_available_chapters_from_source(manga_slug):
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     }
     
+    all_chapters = {}
+    page = 1
+    max_pages = 100  # Safety limit to prevent infinite loops
+    chapters_per_page_limit = 900  # If first page has less than this, assume no pagination needed
+    
     try:
-        log_message(f"Fetching chapter list from: {manga_url}")
-        response = requests.get(manga_url, headers=headers, timeout=15)
-        response.raise_for_status()
+        while page <= max_pages:
+            # Construct URL with page parameter
+            if page == 1:
+                page_url = manga_url
+            else:
+                page_url = f"{manga_url}?page={page}"
+            
+            log_message(f"Fetching chapter list from page {page}: {page_url}")
+            
+            try:
+                response = requests.get(page_url, headers=headers, timeout=15)
+                response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                log_message(f"Error fetching page {page}: {e}", "WARNING")
+                break
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find all chapter links on this page
+            chapter_links = []
+            links = soup.select('ul.main li a')
+            
+            if not links:
+                log_message(f"No chapters found on page {page}, stopping pagination")
+                break
+            
+            for link in links:
+                href = link.get('href')
+                if href and '/chapter-' in href:
+                    # Extract chapter number (supports decimals like 100.5)
+                    match = re.search(r'chapter-([\d.]+)', href)
+                    if match:
+                        chapter_num_str = match.group(1)
+                        try:
+                            chapter_num = float(chapter_num_str)
+                            full_url = urljoin(manga_url, href)
+                            
+                            # Only add if not already present (avoid duplicates across pages)
+                            if chapter_num not in all_chapters:
+                                all_chapters[chapter_num] = {
+                                    'url': full_url,
+                                    'number': chapter_num,
+                                    'text': link.get_text(strip=True)
+                                }
+                        except ValueError:
+                            continue
+            
+            chapters_on_page = len([l for l in links if l.get('href') and '/chapter-' in l.get('href')])
+            log_message(f"Found {chapters_on_page} chapter links on page {page} (total unique: {len(all_chapters)})")
+            
+            # Smart pagination decision
+            if page == 1 and chapters_on_page < chapters_per_page_limit:
+                # First page has less than limit - no pagination needed
+                log_message(f"First page has only {chapters_on_page} chapters (< {chapters_per_page_limit}), skipping pagination")
+                break
+            
+            # Check if there's a next page
+            # Look for pagination links or "next" button
+            next_page = soup.select_one('a.next, a[rel="next"], .pagination a:contains("Next")')
+            
+            if next_page:
+                # Explicit next button found
+                page += 1
+                time.sleep(1)  # Be nice to the server
+            elif page == 1 and chapters_on_page >= chapters_per_page_limit:
+                # First page is near the limit, try next page to be safe
+                log_message(f"First page has {chapters_on_page} chapters (near limit), checking for more pages...")
+                page += 1
+                time.sleep(1)
+            else:
+                # No next page found, we're done
+                log_message(f"No more pages found, stopping at page {page}")
+                break
         
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Find all chapter links
-        chapter_links = []
-        links = soup.select('ul.main li a')
-        
-        for link in links:
-            href = link.get('href')
-            if href and '/chapter-' in href:
-                # Extract chapter number (supports decimals like 100.5)
-                match = re.search(r'chapter-([\d.]+)', href)
-                if match:
-                    chapter_num_str = match.group(1)
-                    try:
-                        chapter_num = float(chapter_num_str)
-                        full_url = urljoin(manga_url, href)
-                        chapter_links.append({
-                            'url': full_url,
-                            'number': chapter_num,
-                            'text': link.get_text(strip=True)
-                        })
-                    except ValueError:
-                        continue
-        
-        # Remove duplicates
-        unique_chapters = {ch['number']: ch for ch in chapter_links}
-        log_message(f"Found {len(unique_chapters)} unique chapters")
-        
-        return unique_chapters
+        log_message(f"Completed - Found {len(all_chapters)} total unique chapters")
+        return all_chapters
         
     except Exception as e:
         log_message(f"Error fetching chapter list: {e}", "ERROR")
-        return {}
+        return all_chapters  # Return what we have so far
 
 
 def find_missing_chapters(existing_chapters, available_chapters):
@@ -258,7 +306,7 @@ def process_manga(manga):
         existing_chapters = get_existing_chapters_from_supabase(manga_id)
         log_message(f"Existing chapters in DB: {len(existing_chapters)}")
         
-        # Step 2: Get available chapters from source
+        # Step 2: Get available chapters from source (WITH PAGINATION)
         available_chapters = get_available_chapters_from_source(manga_slug)
         
         if not available_chapters:
@@ -270,6 +318,8 @@ def process_manga(manga):
                 'new_chapters': 0,
                 'failed_chapters': 0
             }
+        
+        log_message(f"Total available chapters on source: {len(available_chapters)}")
         
         # Step 3: Find missing chapters
         missing_chapters = find_missing_chapters(existing_chapters, available_chapters)
