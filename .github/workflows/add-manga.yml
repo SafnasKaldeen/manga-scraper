@@ -1,0 +1,127 @@
+name: Add New Manga
+on:
+    workflow_dispatch:
+        inputs:
+            manga_slug:
+                description: 'Manga slug (e.g., "one-piece" from MangaRead URL)'
+                required: true
+                type: string
+            
+            title:
+                description: 'Manga title'
+                required: true
+                type: string
+            
+            cover_image_url:
+                description: 'Cover image URL'
+                required: true
+                type: string
+            
+            description:
+                description: 'Manga description'
+                required: false
+                type: string
+            
+            author:
+                description: 'Author name'
+                required: false
+                type: string
+            
+            status:
+                description: 'Status (ongoing/completed/hiatus)'
+                required: false
+                type: choice
+                options:
+                    - ongoing
+                    - completed
+                    - hiatus
+                default: ongoing
+            
+            publication_year:
+                description: 'Publication year (e.g., 2020)'
+                required: false
+                type: string
+            
+            genres:
+                description: 'Genres (comma-separated, e.g., "Action,Adventure,Fantasy")'
+                required: false
+                type: string
+            
+            is_locked:
+                description: 'Is manga locked/premium?'
+                required: false
+                type: boolean
+                default: false
+            
+            max_chapters:
+                description: 'Maximum chapters to scrape (0 = all)'
+                required: false
+                type: string
+                default: '0'
+
+jobs:
+    add-manga:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+            
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            
+            - name: Install Chrome
+              run: |
+                  wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+                  sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+                  sudo apt-get update
+                  sudo apt-get install -y google-chrome-stable
+            
+            - name: Install ChromeDriver
+              run: |
+                  CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d'.' -f1)
+                  wget -q https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/120.0.6099.109/linux64/chromedriver-linux64.zip
+                  unzip chromedriver-linux64.zip
+                  sudo mv chromedriver-linux64/chromedriver /usr/local/bin/
+                  sudo chmod +x /usr/local/bin/chromedriver
+            
+            - name: Install Python dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install selenium requests beautifulsoup4 supabase python-dotenv
+            
+            - name: Run manga scraper
+              env:
+                  SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+                  SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+                  MANGA_SLUG: ${{ github.event.inputs.manga_slug }}
+                  MANGA_TITLE: ${{ github.event.inputs.title }}
+                  COVER_IMAGE_URL: ${{ github.event.inputs.cover_image_url }}
+                  DESCRIPTION: ${{ github.event.inputs.description }}
+                  AUTHOR: ${{ github.event.inputs.author }}
+                  STATUS: ${{ github.event.inputs.status }}
+                  PUBLICATION_YEAR: ${{ github.event.inputs.publication_year }}
+                  GENRES: ${{ github.event.inputs.genres }}
+                  IS_LOCKED: ${{ github.event.inputs.is_locked }}
+                  MAX_CHAPTERS: ${{ github.event.inputs.max_chapters }}
+              run: |
+                  python add_manga_scraper.py
+            
+            - name: Upload scraper logs
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: manga-scraper-logs-${{ github.run_number }}
+                  path: |
+                      manga_scraper_*.log
+                      add_manga_*.log
+                  retention-days: 30
+              continue-on-error: true
+            
+            - name: Comment on workflow run
+              if: success()
+              run: |
+                  echo "✅ Successfully added manga: ${{ github.event.inputs.title }}"
+                  echo "📚 Slug: ${{ github.event.inputs.manga_slug }}"
+                  echo "🔗 Check your Supabase dashboard for the new manga"
