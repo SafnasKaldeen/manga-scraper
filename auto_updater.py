@@ -34,21 +34,33 @@ def log_message(message, level="INFO"):
     print(f"[{timestamp}] [{level}] {message}")
 
 
+def to_db_format(chapter_number) -> str:
+    """
+    Convert any chapter number representation to numeric(10,2) string
+    that matches what Postgres stores and returns.
+    58      → "58.00"
+    58.0    → "58.00"
+    58.1    → "58.10"
+    58.5    → "58.50"
+    "58.10" → "58.10"
+    """
+    return f"{float(str(chapter_number)):.2f}"
+
+
 def format_chapter_number(chapter_number, for_url=False) -> str:
     """
-    Convert chapter number to a clean string.
+    Convert chapter number to a clean display/URL string.
     for_url=True  → uses hyphens: 58.5 → "58-5"  (mangaread URL format)
     for_url=False → uses dots:    58.5 → "58.5"   (display / logging)
     Handles:
       278.0  → "278"
       100.5  → "100.5" or "100-5"
     """
-    if isinstance(chapter_number, float):
-        if chapter_number.is_integer():
-            return str(int(chapter_number))
-        clean = f"{chapter_number:.10g}"
-        return clean.replace('.', '-') if for_url else clean
-    return str(chapter_number)
+    val = float(str(chapter_number))
+    if val == int(val):
+        return str(int(val))
+    clean = f"{val:.10g}"
+    return clean.replace('.', '-') if for_url else clean
 
 
 def get_all_mangas_from_supabase():
@@ -65,9 +77,9 @@ def get_all_mangas_from_supabase():
 
 def get_existing_chapters_from_supabase(manga_id):
     """
-    Get all existing chapter numbers for a manga.
-    If the manga has < 900 chapters, fetch all at once.
-    If >= 900, paginate in batches of 1000 to avoid Supabase limit.
+    Get all existing chapter numbers for a manga as a set of 'XX.YY' strings
+    to reliably match numeric(10,2) values returned by Supabase.
+    Paginates in batches of 1000 for large manga.
     """
     existing = set()
 
@@ -76,15 +88,14 @@ def get_existing_chapters_from_supabase(manga_id):
         manga_result = supabase.table("mangas").select("total_chapters").eq("id", manga_id).single().execute()
         total_chapters = manga_result.data.get("total_chapters", 0) if manga_result.data else 0
 
-        # If manga has fewer than 900 chapters, fetch all at once
         if total_chapters < 900:
             result = supabase.table("chapters").select("chapter_number").eq("manga_id", manga_id).execute()
             for ch in result.data:
-                num = ch["chapter_number"]
-                if isinstance(num, (int, float)):
-                    existing.add(float(num))
+                try:
+                    existing.add(to_db_format(ch["chapter_number"]))
+                except (ValueError, TypeError):
+                    continue
         else:
-            # Paginate in batches of 1000
             BATCH_SIZE = 1000
             start = 0
             while True:
@@ -100,9 +111,10 @@ def get_existing_chapters_from_supabase(manga_id):
                     break
 
                 for ch in data:
-                    num = ch["chapter_number"]
-                    if isinstance(num, (int, float)):
-                        existing.add(float(num))
+                    try:
+                        existing.add(to_db_format(ch["chapter_number"]))
+                    except (ValueError, TypeError):
+                        continue
 
                 if len(data) < BATCH_SIZE:
                     break
@@ -137,24 +149,24 @@ def get_available_chapters_from_source(manga_slug):
         for link in links:
             href = link.get('href')
             if href and '/chapter-' in href:
-                # Handles: chapter-58   → 58.0
-                #          chapter-58-5 → 58.5  (mangaread uses hyphens for decimals)
-                #          chapter-58.5 → 58.5
+                # Handles: chapter-58   → 58.00
+                #          chapter-58-5 → 58.50  (mangaread uses hyphens for decimals)
+                #          chapter-58.5 → 58.50
                 match = re.search(r'chapter-([\d]+(?:\.[\d]+|-[\d]+)?)', href)
                 if match:
                     chapter_num_str = match.group(1).replace('-', '.')
                     try:
-                        chapter_num = float(chapter_num_str)
+                        db_key = to_db_format(chapter_num_str)  # "58.10" etc.
                         full_url = urljoin(manga_url, href)
                         chapter_links.append({
                             'url': full_url,
-                            'number': chapter_num,
+                            'number': db_key,
                             'text': link.get_text(strip=True)
                         })
                     except ValueError:
                         continue
 
-        # Remove duplicates
+        # Remove duplicates keyed by db_format string
         unique_chapters = {ch['number']: ch for ch in chapter_links}
         log_message(f"Found {len(unique_chapters)} unique chapters")
 
@@ -197,7 +209,6 @@ def scrape_chapter_images(chapter_url):
 
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Find images only in page-break no-gaps class
         images = soup.select('.page-break.no-gaps img')
 
         image_urls = []
@@ -221,18 +232,20 @@ def scrape_chapter_images(chapter_url):
 def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls):
     """Save or update chapter and its panels to Supabase"""
     try:
-        # Convert chapter_number to appropriate type
-        if isinstance(chapter_number, str):
-            chapter_number = float(chapter_number)
+        # Normalize to "XX.YY" string to match numeric(10,2) in Postgres
+        db_chapter_number = to_db_format(chapter_number)
+        display_number = format_chapter_number(chapter_number)
 
-        if isinstance(chapter_number, float) and chapter_number.is_integer():
-            chapter_number = int(chapter_number)
-
-        # Check if chapter exists
-        existing = supabase.table('chapters').select('id').eq('manga_id', manga_id).eq('chapter_number', chapter_number).execute()
+        # Check if chapter exists using the same XX.YY format
+        existing = (
+            supabase.table('chapters')
+            .select('id')
+            .eq('manga_id', manga_id)
+            .eq('chapter_number', db_chapter_number)
+            .execute()
+        )
 
         if existing.data:
-            # Update existing chapter
             chapter_id = existing.data[0]['id']
 
             # Delete existing panels
@@ -244,19 +257,19 @@ def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls
                 'total_panels': len(image_urls),
                 'published_at': datetime.now().isoformat()
             }).eq('id', chapter_id).execute()
-            log_message(f"Updated chapter {format_chapter_number(chapter_number)}")
+            log_message(f"Updated chapter {display_number}")
         else:
-            # Insert new chapter
+            # Insert new chapter with normalized number
             result = supabase.table('chapters').insert({
                 'manga_id': manga_id,
-                'chapter_number': chapter_number,
+                'chapter_number': db_chapter_number,
                 'title': chapter_title,
                 'total_panels': len(image_urls),
                 'published_at': datetime.now().isoformat(),
                 'created_at': datetime.now().isoformat()
             }).execute()
             chapter_id = result.data[0]['id']
-            log_message(f"Created new chapter {format_chapter_number(chapter_number)}")
+            log_message(f"Created new chapter {display_number}")
 
         # Insert panels in batch
         if image_urls:
@@ -270,7 +283,7 @@ def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls
                 })
 
             supabase.table('panels').insert(panels_data).execute()
-            log_message(f"Saved {len(panels_data)} panels for chapter {format_chapter_number(chapter_number)}")
+            log_message(f"Saved {len(panels_data)} panels for chapter {display_number}")
 
         return True
 
