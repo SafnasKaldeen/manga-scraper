@@ -1,5 +1,9 @@
 import os
 import sys
+
+# Force unbuffered output for real-time GitHub Actions logs
+sys.stdout.reconfigure(line_buffering=True)
+
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -28,6 +32,21 @@ def log_message(message, level="INFO"):
     """Log message with timestamp"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}")
+
+
+def format_chapter_number(chapter_number) -> str:
+    """
+    Convert chapter number to a clean URL-safe string.
+    Handles:
+      278.0  → "278"
+      100.5  → "100.5"
+      1.10   → "1.1"  (trailing zero stripped by float, correct for URLs)
+    """
+    if isinstance(chapter_number, float):
+        if chapter_number.is_integer():
+            return str(int(chapter_number))
+        return f"{chapter_number:.10g}"
+    return str(chapter_number)
 
 
 def get_all_mangas_from_supabase():
@@ -223,7 +242,7 @@ def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls
                 'total_panels': len(image_urls),
                 'published_at': datetime.now().isoformat()
             }).eq('id', chapter_id).execute()
-            log_message(f"Updated chapter {chapter_number}")
+            log_message(f"Updated chapter {format_chapter_number(chapter_number)}")
         else:
             # Insert new chapter
             result = supabase.table('chapters').insert({
@@ -235,7 +254,7 @@ def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls
                 'created_at': datetime.now().isoformat()
             }).execute()
             chapter_id = result.data[0]['id']
-            log_message(f"Created new chapter {chapter_number}")
+            log_message(f"Created new chapter {format_chapter_number(chapter_number)}")
         
         # Insert panels in batch
         if image_urls:
@@ -249,7 +268,7 @@ def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls
                 })
             
             supabase.table('panels').insert(panels_data).execute()
-            log_message(f"Saved {len(panels_data)} panels for chapter {chapter_number}")
+            log_message(f"Saved {len(panels_data)} panels for chapter {format_chapter_number(chapter_number)}")
         
         return True
     
@@ -329,7 +348,7 @@ def process_manga(manga):
             chapter_url = chapter['url']
             chapter_title = chapter['text']
             
-            log_message(f"[{idx}/{len(missing_chapters)}] Scraping chapter {chapter_num}...")
+            log_message(f"[{idx}/{len(missing_chapters)}] Scraping chapter {format_chapter_number(chapter_num)}...")
             
             try:
                 # Scrape images
@@ -339,20 +358,20 @@ def process_manga(manga):
                     # Save to Supabase
                     if save_chapter_to_supabase(manga_id, chapter_num, chapter_title, image_urls):
                         success_count += 1
-                        log_message(f"✓ Chapter {chapter_num} saved successfully")
+                        log_message(f"✓ Chapter {format_chapter_number(chapter_num)} saved successfully")
                     else:
                         failed_count += 1
-                        log_message(f"✗ Failed to save chapter {chapter_num}", "ERROR")
+                        log_message(f"✗ Failed to save chapter {format_chapter_number(chapter_num)}", "ERROR")
                 else:
                     failed_count += 1
-                    log_message(f"✗ Failed to scrape chapter {chapter_num}: {error}", "ERROR")
+                    log_message(f"✗ Failed to scrape chapter {format_chapter_number(chapter_num)}: {error}", "ERROR")
                 
                 # Be polite to the server
                 time.sleep(2)
                 
             except Exception as e:
                 failed_count += 1
-                log_message(f"✗ Error processing chapter {chapter_num}: {e}", "ERROR")
+                log_message(f"✗ Error processing chapter {format_chapter_number(chapter_num)}: {e}", "ERROR")
         
         # Update manga statistics
         update_manga_stats(manga_id)
