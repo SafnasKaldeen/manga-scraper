@@ -10,6 +10,7 @@ import re
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from supabase import create_client, Client
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -24,9 +25,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-REPORT_FILE   = f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+REPORT_FILE    = f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
 MANGA_BASE_URL = "https://www.mangaread.org/manga/"
-EXTENSIONS    = [".jpg", ".jpeg", ".png", ".webp"]
+EXTENSIONS     = [".jpg", ".jpeg", ".png", ".webp"]
+MAX_WORKERS    = 20  # concurrent URL checks
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -123,17 +125,11 @@ def update_panel_url(panel_id: str, new_url: str) -> bool:
 
 # ─── Mangaread.org re-scrape fallback ────────────────────────────────────────
 def scrape_chapter_images(chapter_url: str) -> list[str]:
-    """
-    Scrape all image URLs from a chapter page on mangaread.org.
-    Returns ordered list of image URLs (same logic as auto_updater.py).
-    """
     try:
         response = requests.get(chapter_url, headers=SCRAPE_HEADERS, timeout=15)
         response.raise_for_status()
-
         soup = BeautifulSoup(response.content, "html.parser")
         images = soup.select(".page-break.no-gaps img")
-
         image_urls = []
         for img in images:
             img_url = (
@@ -146,21 +142,15 @@ def scrape_chapter_images(chapter_url: str) -> list[str]:
                 img_url = img_url.strip()
                 full_url = urljoin(chapter_url, img_url)
                 image_urls.append(full_url)
-
         return image_urls
-
     except Exception as e:
         log(f"  ✗ Failed to scrape {chapter_url}: {e}", "ERROR")
         return []
 
 
 def find_url_from_mangaread(panel: dict) -> str | None:
-    """
-    Re-scrape the chapter page and return the fresh URL for this specific panel.
-    Falls back to mangaread.org when extension variants all 404.
-    """
     try:
-        chapter_data = panel.get("chapter", {})
+        chapter_data   = panel.get("chapter", {})
         chapter_number = chapter_data.get("chapter_number")
         manga_data     = chapter_data.get("manga", {})
         manga_slug     = manga_data.get("slug")
@@ -169,7 +159,6 @@ def find_url_from_mangaread(panel: dict) -> str | None:
             log(f"  ✗ Missing chapter/manga info in panel data", "ERROR")
             return None
 
-        # Build chapter URL — mangaread uses hyphens for decimals: 58.5 → chapter-58-5
         if isinstance(chapter_number, float) and chapter_number.is_integer():
             chapter_str = str(int(chapter_number))
         else:
@@ -179,13 +168,12 @@ def find_url_from_mangaread(panel: dict) -> str | None:
         log(f"  🔍 Re-scraping from mangaread: {chapter_url}")
 
         image_urls = scrape_chapter_images(chapter_url)
-
         if not image_urls:
             log(f"  ✗ No images found on chapter page", "ERROR")
             return None
 
         panel_number = panel.get("panel_number", 1)
-        panel_index  = panel_number - 1  # panel_number is 1-based
+        panel_index  = panel_number - 1
 
         if panel_index < 0 or panel_index >= len(image_urls):
             log(f"  ✗ Panel {panel_number} out of range (chapter has {len(image_urls)} images)", "ERROR")
@@ -194,7 +182,6 @@ def find_url_from_mangaread(panel: dict) -> str | None:
         fresh_url = image_urls[panel_index]
         log(f"  ✓ Got fresh URL from mangaread: {fresh_url}")
 
-        # Verify the fresh URL actually works before returning it
         ok, status = check_url(fresh_url)
         if ok:
             return fresh_url
@@ -209,24 +196,15 @@ def find_url_from_mangaread(panel: dict) -> str | None:
 
 # ─── Core fix logic ───────────────────────────────────────────────────────────
 def fix_broken_panel(panel: dict) -> tuple[str, str | None]:
-    """
-    Try to fix a broken panel URL in order:
-      1. Extension variants (.jpg / .jpeg / .png / .webp)
-      2. Re-scrape from mangaread.org
-
-    Returns (strategy, working_url) or (strategy, None) if unfixable.
-    """
     image_url = panel["image_url"]
 
-    # Step 1: try extension swaps
     log(f"  Trying extension variants...")
     working = try_extension_variants(image_url)
     if working:
         return "extension_fix", working
 
-    # Step 2: re-scrape from mangaread
     log(f"  Extension variants failed — falling back to mangaread re-scrape...")
-    time.sleep(1)  # be polite before scraping
+    time.sleep(1)
     working = find_url_from_mangaread(panel)
     if working:
         return "rescrape_fix", working
@@ -235,6 +213,12 @@ def fix_broken_panel(panel: dict) -> tuple[str, str | None]:
 
 
 # ─── Per-manga validation ─────────────────────────────────────────────────────
+def check_panel_worker(panel: dict) -> tuple[dict, bool, int]:
+    """Worker function for thread pool — returns (panel, ok, status)."""
+    ok, status = check_url(panel["image_url"])
+    return panel, ok, status
+
+
 def validate_manga(manga: dict) -> dict:
     manga_id    = manga["id"]
     manga_title = manga["title"]
@@ -246,64 +230,69 @@ def validate_manga(manga: dict) -> dict:
 
     panels = get_panels_for_manga(manga_id)
     log(f"Total panels to check: {len(panels)}")
+    log(f"Running {MAX_WORKERS} concurrent URL checks...")
 
-    broken_count      = 0
+    broken_panels     = []
+    checked           = 0
     extension_fixed   = 0
     rescrape_fixed    = 0
     unfixable_panels  = []
 
-    for i, panel in enumerate(panels, 1):
-        panel_id  = panel["id"]
-        image_url = panel["image_url"]
+    # ── Parallel URL checks ──────────────────────────────────────────────────
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(check_panel_worker, panel): panel for panel in panels}
 
-        ok, status = check_url(image_url)
+        for future in as_completed(futures):
+            panel, ok, status = future.result()
+            checked += 1
 
-        if ok:
-            if i % 50 == 0:
-                log(f"  Progress: {i}/{len(panels)} checked...")
-            continue  # no sleep on healthy panels — HEAD requests are fast
+            if checked % 200 == 0:
+                log(f"  Progress: {checked}/{len(panels)} checked, {len(broken_panels)} broken so far...")
 
-        # Broken URL found
-        broken_count += 1
-        log(f"  ✗ BROKEN [{status}] panel {panel['panel_number']}: {image_url}", "WARNING")
+            if not ok:
+                log(f"  ✗ BROKEN [{status}] panel {panel['panel_number']}: {panel['image_url']}", "WARNING")
+                broken_panels.append((panel, status))
 
-        if not FIX_URLS:
-            unfixable_panels.append(panel)
-            continue
+    log(f"  ✓ URL check complete: {checked} checked, {len(broken_panels)} broken")
 
-        strategy, working_url = fix_broken_panel(panel)
+    # ── Fix broken panels sequentially (scraping must be polite) ────────────
+    if FIX_URLS:
+        for panel, status in broken_panels:
+            strategy, working_url = fix_broken_panel(panel)
 
-        if working_url:
-            if update_panel_url(panel_id, working_url):
-                log(f"  ✓ Fixed via [{strategy}] panel {panel['panel_number']} → {working_url}")
-                if strategy == "extension_fix":
-                    extension_fixed += 1
+            if working_url:
+                if update_panel_url(panel["id"], working_url):
+                    log(f"  ✓ Fixed via [{strategy}] panel {panel['panel_number']} → {working_url}")
+                    if strategy == "extension_fix":
+                        extension_fixed += 1
+                    else:
+                        rescrape_fixed += 1
                 else:
-                    rescrape_fixed += 1
+                    log(f"  ✗ Found URL but Supabase update failed", "ERROR")
+                    unfixable_panels.append(panel)
             else:
-                log(f"  ✗ Found URL but Supabase update failed", "ERROR")
+                log(f"  ✗ Could not fix panel {panel['panel_number']} — all strategies failed", "ERROR")
                 unfixable_panels.append(panel)
-        else:
-            log(f"  ✗ Could not fix panel {panel['panel_number']} — all strategies failed", "ERROR")
-            unfixable_panels.append(panel)
 
-        time.sleep(0.5)  # rate limit between fix attempts
+            time.sleep(0.5)
+    else:
+        unfixable_panels = [p for p, _ in broken_panels]
 
     log(f"\nResults for {manga_title}:")
     log(f"  Total checked     : {len(panels)}")
-    log(f"  Broken            : {broken_count}")
+    log(f"  Broken            : {len(broken_panels)}")
     log(f"  Fixed (extension) : {extension_fixed}")
     log(f"  Fixed (re-scrape) : {rescrape_fixed}")
     log(f"  Unfixable         : {len(unfixable_panels)}")
 
     return {
-        "manga":             manga_title,
-        "total":             len(panels),
-        "broken":            broken_count,
-        "extension_fixed":   extension_fixed,
-        "rescrape_fixed":    rescrape_fixed,
-        "unfixable":         len(unfixable_panels),
-        "unfixable_panels":  unfixable_panels,
+        "manga":            manga_title,
+        "total":            len(panels),
+        "broken":           len(broken_panels),
+        "extension_fixed":  extension_fixed,
+        "rescrape_fixed":   rescrape_fixed,
+        "unfixable":        len(unfixable_panels),
+        "unfixable_panels": unfixable_panels,
     }
 
 
@@ -312,9 +301,10 @@ def main():
     log("=" * 70)
     log("IMAGE URL VALIDATOR - STARTING")
     log("=" * 70)
-    log(f"Target     : {MANGA_SLUG or 'ALL mangas'}")
-    log(f"Auto-fix   : {FIX_URLS}")
-    log(f"Report file: {REPORT_FILE}")
+    log(f"Target      : {MANGA_SLUG or 'ALL mangas'}")
+    log(f"Auto-fix    : {FIX_URLS}")
+    log(f"Workers     : {MAX_WORKERS}")
+    log(f"Report file : {REPORT_FILE}")
     log("")
 
     mangas = get_mangas()
@@ -363,7 +353,6 @@ def main():
     log("\n✓ Validation complete!")
     log("=" * 70)
 
-    # Non-zero exit so GitHub Actions marks the run as failed when panels are broken
     if total_unfixable > 0:
         sys.exit(2)
 
