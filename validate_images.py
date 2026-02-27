@@ -1,6 +1,9 @@
-
 import os
 import sys
+
+# Force unbuffered output so GitHub Actions shows logs in real time
+sys.stdout.reconfigure(line_buffering=True)
+
 import requests
 import time
 import re
@@ -166,11 +169,13 @@ def find_url_from_mangaread(panel: dict) -> str | None:
             log(f"  ✗ Missing chapter/manga info in panel data", "ERROR")
             return None
 
-        # Build chapter URL — handle decimal chapters like 100.5
+        # Build chapter URL — mangaread uses hyphens for decimals: 58.5 → chapter-58-5
         if isinstance(chapter_number, float) and chapter_number.is_integer():
-            chapter_number = int(chapter_number)
+            chapter_str = str(int(chapter_number))
+        else:
+            chapter_str = f"{chapter_number:.10g}".replace('.', '-')
 
-        chapter_url = f"{MANGA_BASE_URL}{manga_slug}/chapter-{chapter_number}/"
+        chapter_url = f"{MANGA_BASE_URL}{manga_slug}/chapter-{chapter_str}/"
         log(f"  🔍 Re-scraping from mangaread: {chapter_url}")
 
         image_urls = scrape_chapter_images(chapter_url)
@@ -254,10 +259,9 @@ def validate_manga(manga: dict) -> dict:
         ok, status = check_url(image_url)
 
         if ok:
-            if i % 100 == 0:
+            if i % 50 == 0:
                 log(f"  Progress: {i}/{len(panels)} checked...")
-            time.sleep(0.1)
-            continue
+            continue  # no sleep on healthy panels — HEAD requests are fast
 
         # Broken URL found
         broken_count += 1
