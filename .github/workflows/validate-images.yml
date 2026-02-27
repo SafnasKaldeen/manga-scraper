@@ -50,7 +50,7 @@ jobs:
           MANGA_SLUG: ${{ github.event.inputs.manga_slug || '' }}
           FIX_URLS: ${{ github.event.inputs.fix_urls || 'true' }}
         run: |
-          python validate_images.py
+          python -u validate_images.py
 
       - name: Upload validation report
         if: always()
