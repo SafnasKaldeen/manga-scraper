@@ -34,18 +34,20 @@ def log_message(message, level="INFO"):
     print(f"[{timestamp}] [{level}] {message}")
 
 
-def format_chapter_number(chapter_number) -> str:
+def format_chapter_number(chapter_number, for_url=False) -> str:
     """
-    Convert chapter number to a clean URL-safe string.
+    Convert chapter number to a clean string.
+    for_url=True  → uses hyphens: 58.5 → "58-5"  (mangaread URL format)
+    for_url=False → uses dots:    58.5 → "58.5"   (display / logging)
     Handles:
       278.0  → "278"
-      100.5  → "100.5"
-      1.10   → "1.1"  (trailing zero stripped by float, correct for URLs)
+      100.5  → "100.5" or "100-5"
     """
     if isinstance(chapter_number, float):
         if chapter_number.is_integer():
             return str(int(chapter_number))
-        return f"{chapter_number:.10g}"
+        clean = f"{chapter_number:.10g}"
+        return clean.replace('.', '-') if for_url else clean
     return str(chapter_number)
 
 
@@ -136,10 +138,13 @@ def get_available_chapters_from_source(manga_slug):
         for link in links:
             href = link.get('href')
             if href and '/chapter-' in href:
-                # Extract chapter number (supports decimals like 100.5)
-                match = re.search(r'chapter-([\d.]+)', href)
+                # Extract chapter number
+                # Handles: chapter-58 → 58.0
+                #          chapter-58-5 → 58.5  (mangaread uses hyphens for decimals)
+                #          chapter-58.5 → 58.5
+                match = re.search(r'chapter-([\d]+(?:[.\-][\d]+)?)', href)
                 if match:
-                    chapter_num_str = match.group(1)
+                    chapter_num_str = match.group(1).replace('-', '.')
                     try:
                         chapter_num = float(chapter_num_str)
                         full_url = urljoin(manga_url, href)
