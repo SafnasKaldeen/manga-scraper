@@ -39,7 +39,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 SEARCH_QUERIES = [
     "anime",
     "manga",
-    "anime news",
 ]
 
 MAX_ARTICLES_PER_QUERY = 50
