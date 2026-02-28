@@ -39,7 +39,7 @@ jobs:
       - name: Verify selenium
         run: |
           pip show selenium
-          python -c "from selenium.webdriver.by import By; print('Selenium OK')"
+          python -c "from selenium.webdriver.common.by import By; print('Selenium OK')"
 
       - name: Run scraper
         env:
