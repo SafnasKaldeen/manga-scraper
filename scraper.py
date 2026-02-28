@@ -37,7 +37,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-SEARCH_QUERIES         = ["anime", "manga"]
+SEARCH_QUERIES         = ["anime", "manga", "anime news"]
 MAX_ARTICLES_PER_QUERY = 50
 URL_RESOLVE_TIMEOUT    = 4   # seconds per article URL
 
