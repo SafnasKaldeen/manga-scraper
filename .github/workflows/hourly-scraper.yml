@@ -1,4 +1,5 @@
 name: Hourly News Scraper (Anime & Manga)
+
 on:
   schedule:
     - cron: '0 * * * *'
@@ -8,6 +9,7 @@ jobs:
   scrape-news:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,8 +47,18 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           echo "▶ Starting anime & manga news scraper..."
-          python scraper.py
+          python scraper.py anime 50
+          python scraper.py manga 50
           echo "✓ Scraper finished"
+
+      - name: Upload results as artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-results-${{ github.run_number }}
+          path: |
+            results_*.json
+          retention-days: 3
 
       - name: Upload logs on failure
         if: failure()
