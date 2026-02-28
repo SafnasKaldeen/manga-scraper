@@ -1,7 +1,9 @@
 """
 Google News Scraper → Supabase
-Scrapes Google News for anime/manga queries and saves to news_articles table.
-Duplicates skipped via article_url UNIQUE constraint.
+Deduplication:
+  - By article_url  (UNIQUE constraint in DB)
+  - By normalised title (catches same story from different URLs)
+  Both checks happen BEFORE resolving URLs, saving time on known duplicates.
 expires_at set automatically by Supabase trigger: set_news_article_expiry()
 """
 
@@ -37,12 +39,10 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 SEARCH_QUERIES         = ["anime", "manga"]
 MAX_ARTICLES_PER_QUERY = 50
+URL_RESOLVE_TIMEOUT    = 4   # seconds per article URL
 
 READY_SEL = "a.WwrzSb, a.JtKRv"
 IMAGE_SEL = ["img.Quavad", "figure img.Quavad", "figure img"]
-
-# How long to wait for a single URL redirect before giving up
-URL_RESOLVE_TIMEOUT = 4   # seconds — keep this short
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,6 +51,14 @@ URL_RESOLVE_TIMEOUT = 4   # seconds — keep this short
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TITLE NORMALISATION — strips punctuation/case for reliable comparison
+# ─────────────────────────────────────────────────────────────────────────────
+def norm(title: str) -> str:
+    """Lowercase + strip all non-alphanumeric chars for fuzzy-safe comparison."""
+    return re.sub(r"[^a-z0-9]", "", title.lower())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +105,7 @@ def scroll_page(driver, scrolls=5, pause=1.5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JS DOM HELPERS
+# JS DOM HELPERS — walk up ancestor tree
 # ─────────────────────────────────────────────────────────────────────────────
 def js_up_text(driver, el, sel):
     return driver.execute_script("""
@@ -147,10 +155,8 @@ def js_up_image(driver, el, sel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # URL RESOLUTION
-# Strategy:
-#   1. Try requests first (fast, ~1s) — works for most sites
-#   2. Fall back to Selenium tab only if requests lands on Google
-#   3. Hard timeout of URL_RESOLVE_TIMEOUT on the Selenium tab
+# 1. requests fast path (~1s, no browser needed, works for ~70% of sites)
+# 2. Selenium tab fallback with hard page-load timeout
 # ─────────────────────────────────────────────────────────────────────────────
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -161,38 +167,26 @@ SESSION.headers.update({
 
 
 def resolve_url_fast(google_url):
-    """
-    Step 1: try requests — fast and works for ~70% of articles.
-    Returns the real URL, or None if it's still on Google.
-    """
     try:
         r = SESSION.get(google_url, allow_redirects=True, timeout=5)
-        url = r.url
-        if "google.com" not in url:
-            return url
+        if "google.com" not in r.url:
+            return r.url
     except Exception:
         pass
     return None
 
 
 def resolve_url_via_selenium(driver, google_url, timeout=URL_RESOLVE_TIMEOUT):
-    """
-    Step 2: open in a new Selenium tab — bypasses /sorry CAPTCHA.
-    Hard-capped at `timeout` seconds per article.
-    """
     original = driver.current_window_handle
     try:
         driver.execute_script("window.open('');")
         new_handle = [h for h in driver.window_handles if h != original][-1]
         driver.switch_to.window(new_handle)
-
-        # Set page load timeout so the tab never hangs forever
         driver.set_page_load_timeout(timeout)
-
         try:
             driver.get(google_url)
         except Exception:
-            pass  # timeout or nav error — check current URL anyway
+            pass
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -200,11 +194,10 @@ def resolve_url_via_selenium(driver, google_url, timeout=URL_RESOLVE_TIMEOUT):
             if "google.com" not in current and "about:blank" not in current:
                 driver.close()
                 driver.switch_to.window(original)
-                driver.set_page_load_timeout(30)  # reset to default
+                driver.set_page_load_timeout(30)
                 return current
             time.sleep(0.3)
 
-        # Timed out — return whatever URL we have
         final = driver.current_url
         driver.close()
         driver.switch_to.window(original)
@@ -212,7 +205,6 @@ def resolve_url_via_selenium(driver, google_url, timeout=URL_RESOLVE_TIMEOUT):
         return final if "google.com" not in final else google_url
 
     except Exception as e:
-        log(f"  Tab error: {e}", "WARNING")
         try:
             driver.close()
             driver.switch_to.window(original)
@@ -223,15 +215,10 @@ def resolve_url_via_selenium(driver, google_url, timeout=URL_RESOLVE_TIMEOUT):
 
 
 def resolve_url(driver, google_url):
-    """Try fast requests first, fall back to Selenium tab."""
-    # Fast path
     url = resolve_url_fast(google_url)
     if url:
         return url, "fast"
-
-    # Slow path (Selenium tab)
-    url = resolve_url_via_selenium(driver, google_url, timeout=URL_RESOLVE_TIMEOUT)
-    return url, "tab"
+    return resolve_url_via_selenium(driver, google_url), "tab"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,20 +245,41 @@ def extract_og_image(url, timeout=5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUPABASE
+# SUPABASE — load ALL existing urls + titles once at startup
 # ─────────────────────────────────────────────────────────────────────────────
-def get_existing_urls(query):
+def load_existing_records():
+    """
+    Fetch every article_url and title from the DB at startup.
+    - existing_urls  → skip if same URL appears again (different query)
+    - existing_titles → skip if same story appears under a different URL
+    Paginates in batches of 1000 for large tables.
+    """
+    existing_urls   = set()
+    existing_titles = set()
     try:
-        result = (
-            supabase.table("news_articles")
-            .select("article_url")
-            .eq("query", query)
-            .execute()
-        )
-        return {row["article_url"] for row in result.data}
+        batch = 1000
+        start = 0
+        while True:
+            result = (
+                supabase.table("news_articles")
+                .select("article_url, title")
+                .range(start, start + batch - 1)
+                .execute()
+            )
+            if not result.data:
+                break
+            for row in result.data:
+                existing_urls.add(row["article_url"])
+                existing_titles.add(norm(row["title"]))
+            if len(result.data) < batch:
+                break
+            start += batch
+
+        log(f"Loaded {len(existing_urls)} existing URLs and {len(existing_titles)} titles from DB")
     except Exception as e:
-        log(f"Error fetching existing URLs: {e}", "ERROR")
-        return set()
+        log(f"Error loading existing records: {e}", "ERROR")
+
+    return existing_urls, existing_titles
 
 
 def save_article_to_supabase(article: dict) -> bool:
@@ -293,7 +301,7 @@ def save_article_to_supabase(article: dict) -> bool:
     except Exception as e:
         err = str(e)
         if "unique" in err.lower() or "duplicate" in err.lower() or "23505" in err:
-            log(f"  ↩  Duplicate: {article['title'][:60]}")
+            log(f"  ↩  DB duplicate caught: {article['title'][:60]}")
         else:
             log(f"  ✗  DB error: {err}", "ERROR")
         return False
@@ -302,7 +310,11 @@ def save_article_to_supabase(article: dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # SCRAPE ONE QUERY
 # ─────────────────────────────────────────────────────────────────────────────
-def scrape_query(driver, query, max_articles=50):
+def scrape_query(driver, query, max_articles, existing_urls, existing_titles):
+    """
+    existing_urls and existing_titles are passed in (loaded once at startup)
+    and updated in-place as new articles are queued, so cross-query dedup works.
+    """
     log("=" * 70)
     log(f"Query: '{query}'")
     log("=" * 70)
@@ -321,13 +333,9 @@ def scrape_query(driver, query, max_articles=50):
     scroll_page(driver, scrolls=5, pause=1.5)
 
     link_els = driver.find_elements(By.CSS_SELECTOR, READY_SEL)
-    log(f"Found {len(link_els)} article links — processing up to {max_articles}")
+    log(f"Found {len(link_els)} links — processing up to {max_articles}")
 
-    existing_urls = get_existing_urls(query)
-    log(f"Already in DB for this query: {len(existing_urls)}")
-
-    articles    = []
-    seen_titles = set()
+    articles = []
 
     for i, link_el in enumerate(link_els[:max_articles]):
         try:
@@ -337,7 +345,7 @@ def scrape_query(driver, query, max_articles=50):
             if not href.startswith("http"):
                 href = "https://news.google.com/" + href.lstrip("./")
 
-            # Title
+            # ── Title ─────────────────────────────────────────────────────
             title = ""
             for sel in ["h3", "h4"]:
                 try:
@@ -350,11 +358,16 @@ def scrape_query(driver, query, max_articles=50):
                 lines = (link_el.text or "").strip().splitlines()
                 title = next((l.strip() for l in lines if l.strip()), "")
 
-            if not title or title in seen_titles:
+            if not title:
                 continue
-            seen_titles.add(title)
 
-            # Publisher & time
+            # ── TITLE DEDUP — check BEFORE resolving URL (saves time) ─────
+            title_key = norm(title)
+            if title_key in existing_titles:
+                log(f"[{i+1:>3}] ↩  Title already known: {title[:65]}")
+                continue
+
+            # ── Publisher & time ──────────────────────────────────────────
             publisher = (
                 js_up_text(driver, link_el, "div.vr1PYe") or
                 js_up_text(driver, link_el, "a.wEwyrc") or
@@ -365,7 +378,7 @@ def scrape_query(driver, query, max_articles=50):
                 js_up_attr(driver, link_el, "time[datetime]", "datetime")
             )
 
-            # Thumbnail
+            # ── Thumbnail ─────────────────────────────────────────────────
             image = None
             for img_sel in IMAGE_SEL:
                 image = js_up_image(driver, link_el, img_sel)
@@ -374,14 +387,13 @@ def scrape_query(driver, query, max_articles=50):
                         image = "https://news.google.com" + image
                     break
 
-            # Resolve URL — fast path first, Selenium fallback
+            # ── Resolve real URL ──────────────────────────────────────────
             log(f"[{i+1:>3}] Resolving: {title[:55]}...")
             t0 = time.time()
             real_url, method = resolve_url(driver, href)
             elapsed = time.time() - t0
             on_google = "google.com" in real_url
 
-            log(f"       Title     : {title[:65]}")
             log(f"       Publisher : {publisher}  |  Published : {published or 'N/A'}")
             log(f"       URL ({method}, {elapsed:.1f}s): {real_url[:65]}")
             log(f"       Image     : {'✅' if image else '—'}")
@@ -396,9 +408,16 @@ def scrape_query(driver, query, max_articles=50):
                 log(f"       ⚠  Redirect blocked — skipping")
                 continue
 
+            # ── URL DEDUP ─────────────────────────────────────────────────
             if real_url in existing_urls:
-                log(f"       ↩  Already in DB — skipping")
+                log(f"       ↩  URL already in DB — skipping")
+                # Still add title so we don't re-process it this run
+                existing_titles.add(title_key)
                 continue
+
+            # ── Accept — add to both sets immediately for cross-query dedup
+            existing_urls.add(real_url)
+            existing_titles.add(title_key)
 
             articles.append({
                 "title":       title,
@@ -429,6 +448,9 @@ def main():
     log(f"URL timeout   : {URL_RESOLVE_TIMEOUT}s per article")
     log("")
 
+    # Load all known URLs + titles ONCE — shared across all queries this run
+    existing_urls, existing_titles = load_existing_records()
+
     driver        = setup_driver()
     total_saved   = 0
     total_skipped = 0
@@ -437,7 +459,10 @@ def main():
         for q_idx, query in enumerate(SEARCH_QUERIES, 1):
             log(f"\nQUERY {q_idx}/{len(SEARCH_QUERIES)}: '{query}'")
 
-            articles = scrape_query(driver, query, max_articles=MAX_ARTICLES_PER_QUERY)
+            articles = scrape_query(
+                driver, query, MAX_ARTICLES_PER_QUERY,
+                existing_urls, existing_titles   # shared, updated in-place
+            )
 
             log(f"\nSaving {len(articles)} new articles to Supabase...")
             for article in articles:
