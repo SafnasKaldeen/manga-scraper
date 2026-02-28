@@ -1,471 +1,458 @@
+"""
+Google News Scraper → Supabase
+Scrapes Google News for given queries and saves articles to news_articles table.
+Skips duplicates via article_url UNIQUE constraint.
+Expiry is handled automatically by the Supabase trigger: set_news_article_expiry()
+"""
+
 import os
 import sys
 
-# Force unbuffered output for real-time GitHub Actions logs
 sys.stdout.reconfigure(line_buffering=True)
+
+import time
+import random
+import re
+import json
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-import time
-import re
-from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
 from supabase import create_client, Client
 
-# Supabase Configuration
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-FORCE_UPDATE = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("✗ Error: SUPABASE_URL and SUPABASE_KEY environment variables must be set")
     sys.exit(1)
 
-# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Base URL for manga source
-MANGA_BASE_URL = "https://www.mangaread.org/manga/"
+# Queries to scrape — add/remove as needed
+SEARCH_QUERIES = [
+    "anime",
+    "manga",
+    "anime news",
+]
+
+MAX_ARTICLES_PER_QUERY = 50
+
+READY_SEL = "a.WwrzSb, a.JtKRv"
+IMAGE_SEL = ["img.Quavad", "figure img.Quavad", "figure img"]
 
 
-def log_message(message, level="INFO"):
-    """Log message with timestamp"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{level}] {message}")
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+def log(msg, level="INFO"):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
 
 
-def to_db_format(chapter_number) -> str:
-    """
-    Convert any chapter number representation to numeric(10,2) string
-    that matches what Postgres stores and returns.
-    58      → "58.00"
-    58.0    → "58.00"
-    58.1    → "58.10"
-    58.5    → "58.50"
-    "58.10" → "58.10"
-    """
-    return f"{float(str(chapter_number)):.2f}"
+# ─────────────────────────────────────────────────────────────────────────────
+# SELENIUM DRIVER
+# ─────────────────────────────────────────────────────────────────────────────
+def setup_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--lang=en-US")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-gpu")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+    driver = webdriver.Chrome(options=options)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+    })
+    return driver
 
 
-def format_chapter_number(chapter_number, for_url=False) -> str:
-    """
-    Convert chapter number to a clean display/URL string.
-    for_url=True  → uses hyphens: 58.5 → "58-5"  (mangaread URL format)
-    for_url=False → uses dots:    58.5 → "58.5"   (display / logging)
-    Handles:
-      278.0  → "278"
-      100.5  → "100.5" or "100-5"
-    """
-    val = float(str(chapter_number))
-    if val == int(val):
-        return str(int(val))
-    clean = f"{val:.10g}"
-    return clean.replace('.', '-') if for_url else clean
+def wait_for_render(driver, timeout=30):
+    log(f"Waiting for page render (up to {timeout}s)...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if driver.find_elements(By.CSS_SELECTOR, READY_SEL):
+            log("Page rendered ✓")
+            return True
+        time.sleep(1)
+    return False
 
 
-def get_all_mangas_from_supabase():
-    """Fetch all mangas from Supabase"""
+def scroll_page(driver, scrolls=5, pause=1.5):
+    for _ in range(scrolls):
+        driver.execute_script("window.scrollBy(0, 900);")
+        time.sleep(pause)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JS DOM HELPERS — walk up ancestor tree
+# ─────────────────────────────────────────────────────────────────────────────
+def js_up_text(driver, el, sel):
+    return driver.execute_script("""
+        var node = arguments[0], sel = arguments[1];
+        for (var i = 0; i < 12; i++) {
+            node = node.parentElement;
+            if (!node) return null;
+            var f = node.querySelector(sel);
+            if (f) return f.textContent.trim();
+        }
+        return null;
+    """, el, sel)
+
+
+def js_up_attr(driver, el, sel, attr):
+    return driver.execute_script("""
+        var node = arguments[0], sel = arguments[1], attr = arguments[2];
+        for (var i = 0; i < 12; i++) {
+            node = node.parentElement;
+            if (!node) return null;
+            var f = node.querySelector(sel);
+            if (f) return f.getAttribute(attr);
+        }
+        return null;
+    """, el, sel, attr)
+
+
+def js_up_image(driver, el, sel):
+    return driver.execute_script("""
+        var node = arguments[0], sel = arguments[1];
+        for (var i = 0; i < 12; i++) {
+            node = node.parentElement;
+            if (!node) return null;
+            var img = node.querySelector(sel);
+            if (img) {
+                var ss = img.getAttribute('srcset') || '';
+                if (ss) {
+                    var parts = ss.split(',').map(s => s.trim().split(' ')[0]).filter(Boolean);
+                    if (parts.length) return parts[parts.length - 1];
+                }
+                return img.getAttribute('src') || null;
+            }
+        }
+        return null;
+    """, el, sel)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# URL RESOLUTION via new Selenium tab (avoids /sorry CAPTCHA)
+# ─────────────────────────────────────────────────────────────────────────────
+def resolve_url_via_selenium(driver, google_url, timeout=8):
+    original = driver.current_window_handle
     try:
-        log_message("Fetching all mangas from Supabase...")
-        result = supabase.table('mangas').select('id, title, slug').execute()
-        log_message(f"Found {len(result.data)} mangas in database")
-        return result.data
-    except Exception as e:
-        log_message(f"Error fetching mangas: {e}", "ERROR")
-        return []
+        driver.execute_script("window.open('');")
+        new_handle = [h for h in driver.window_handles if h != original][-1]
+        driver.switch_to.window(new_handle)
+        driver.get(google_url)
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            current = driver.current_url
+            if "google.com" not in current and "about:blank" not in current:
+                driver.close()
+                driver.switch_to.window(original)
+                return current
+            time.sleep(0.5)
+
+        # Still on Google — try canonical from page source
+        final_url = driver.current_url
+        try:
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            canon = soup.find("link", rel="canonical")
+            if canon and canon.get("href") and "google.com" not in canon["href"]:
+                final_url = canon["href"]
+        except Exception:
+            pass
+
+        driver.close()
+        driver.switch_to.window(original)
+        return final_url
+
+    except Exception:
+        try:
+            driver.close()
+            driver.switch_to.window(original)
+        except Exception:
+            pass
+        return google_url
 
 
-def get_existing_chapters_from_supabase(manga_id):
-    """
-    Get all existing chapter numbers for a manga as a set of 'XX.YY' strings
-    to reliably match numeric(10,2) values returned by Supabase.
-    Paginates in batches of 1000 for large manga.
-    """
-    existing = set()
+# ─────────────────────────────────────────────────────────────────────────────
+# OG IMAGE fallback
+# ─────────────────────────────────────────────────────────────────────────────
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
+
+def extract_og_image(url, timeout=8):
+    if not url or "google.com" in url:
+        return None
     try:
-        # First, fetch total chapters count for this manga
-        manga_result = supabase.table("mangas").select("total_chapters").eq("id", manga_id).single().execute()
-        total_chapters = manga_result.data.get("total_chapters", 0) if manga_result.data else 0
-
-        if total_chapters < 900:
-            result = supabase.table("chapters").select("chapter_number").eq("manga_id", manga_id).execute()
-            for ch in result.data:
-                try:
-                    existing.add(to_db_format(ch["chapter_number"]))
-                except (ValueError, TypeError):
-                    continue
-        else:
-            BATCH_SIZE = 1000
-            start = 0
-            while True:
-                result = (
-                    supabase.table("chapters")
-                    .select("chapter_number")
-                    .eq("manga_id", manga_id)
-                    .range(start, start + BATCH_SIZE - 1)
-                    .execute()
-                )
-                data = result.data
-                if not data:
-                    break
-
-                for ch in data:
-                    try:
-                        existing.add(to_db_format(ch["chapter_number"]))
-                    except (ValueError, TypeError):
-                        continue
-
-                if len(data) < BATCH_SIZE:
-                    break
-
-                start += BATCH_SIZE
-
-    except Exception as e:
-        log_message(f"Error fetching existing chapters: {e}", "ERROR")
-
-    return existing
+        r = SESSION.get(url, timeout=timeout, allow_redirects=True)
+        soup = BeautifulSoup(r.text, "html.parser")
+        for meta in [
+            soup.find("meta", property="og:image"),
+            soup.find("meta", attrs={"name": "twitter:image"}),
+            soup.find("meta", property="article:image"),
+        ]:
+            if meta:
+                img = meta.get("content", "")
+                if img and "gstatic.com" not in img and "google.com" not in img:
+                    return img
+    except Exception:
+        pass
+    return None
 
 
-def get_available_chapters_from_source(manga_slug):
-    """Scrape available chapters from mangaread.org"""
-    manga_url = f"{MANGA_BASE_URL}{manga_slug}/"
-
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    }
-
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPABASE — get existing URLs to skip duplicates
+# ─────────────────────────────────────────────────────────────────────────────
+def get_existing_urls(query):
+    """Fetch all article_urls already stored for this query."""
     try:
-        log_message(f"Fetching chapter list from: {manga_url}")
-        response = requests.get(manga_url, headers=headers, timeout=15)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        chapter_links = []
-        links = soup.select('ul.main li a')
-
-        for link in links:
-            href = link.get('href')
-            if href and '/chapter-' in href:
-                # Handles: chapter-58   → 58.00
-                #          chapter-58-5 → 58.50  (mangaread uses hyphens for decimals)
-                #          chapter-58.5 → 58.50
-                match = re.search(r'chapter-([\d]+(?:\.[\d]+|-[\d]+)?)', href)
-                if match:
-                    chapter_num_str = match.group(1).replace('-', '.')
-                    try:
-                        db_key = to_db_format(chapter_num_str)  # "58.10" etc.
-                        full_url = urljoin(manga_url, href)
-                        chapter_links.append({
-                            'url': full_url,
-                            'number': db_key,
-                            'text': link.get_text(strip=True)
-                        })
-                    except ValueError:
-                        continue
-
-        # Remove duplicates keyed by db_format string
-        unique_chapters = {ch['number']: ch for ch in chapter_links}
-        log_message(f"Found {len(unique_chapters)} unique chapters")
-
-        return unique_chapters
-
-    except Exception as e:
-        log_message(f"Error fetching chapter list: {e}", "ERROR")
-        return {}
-
-
-def find_missing_chapters(existing_chapters, available_chapters):
-    """Compare existing vs available chapters and return missing ones"""
-    available_nums = set(available_chapters.keys())
-
-    if FORCE_UPDATE:
-        log_message("FORCE_UPDATE enabled - will update all chapters")
-        missing = available_nums
-    else:
-        missing = available_nums - existing_chapters
-
-    missing_chapter_list = []
-    for num in sorted(missing):
-        missing_chapter_list.append(available_chapters[num])
-
-    return missing_chapter_list
-
-
-def scrape_chapter_images(chapter_url):
-    """Scrape image URLs from a single chapter"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://www.mangaread.org/',
-    }
-
-    try:
-        response = requests.get(chapter_url, headers=headers, timeout=10)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        images = soup.select('.page-break.no-gaps img')
-
-        image_urls = []
-        for img in images:
-            img_url = (img.get('src') or
-                      img.get('data-src') or
-                      img.get('data-lazy-src') or
-                      img.get('data-original'))
-
-            if img_url:
-                img_url = img_url.strip()
-                full_url = urljoin(chapter_url, img_url)
-                image_urls.append(full_url)
-
-        return image_urls, True, ""
-
-    except Exception as e:
-        return [], False, str(e)
-
-
-def save_chapter_to_supabase(manga_id, chapter_number, chapter_title, image_urls):
-    """Save or update chapter and its panels to Supabase"""
-    try:
-        # Normalize to "XX.YY" string to match numeric(10,2) in Postgres
-        db_chapter_number = to_db_format(chapter_number)
-        display_number = format_chapter_number(chapter_number)
-
-        # Check if chapter exists using the same XX.YY format
-        existing = (
-            supabase.table('chapters')
-            .select('id')
-            .eq('manga_id', manga_id)
-            .eq('chapter_number', db_chapter_number)
+        result = (
+            supabase.table("news_articles")
+            .select("article_url")
+            .eq("query", query)
             .execute()
         )
+        return {row["article_url"] for row in result.data}
+    except Exception as e:
+        log(f"Error fetching existing URLs: {e}", "ERROR")
+        return set()
 
-        if existing.data:
-            chapter_id = existing.data[0]['id']
 
-            # Delete existing panels
-            supabase.table('panels').delete().eq('chapter_id', chapter_id).execute()
+def save_article_to_supabase(article: dict) -> bool:
+    """
+    Insert a single article. Skips gracefully if article_url already exists
+    (UNIQUE constraint). Maps scraper fields → table columns.
+    """
+    try:
+        # Parse ISO datetime string → aware datetime for Supabase timestamptz
+        published_at = None
+        if article.get("published"):
+            try:
+                published_at = article["published"]  # Already ISO string, Supabase accepts it
+            except Exception:
+                published_at = None
 
-            # Update chapter
-            supabase.table('chapters').update({
-                'title': chapter_title,
-                'total_panels': len(image_urls),
-                'published_at': datetime.now().isoformat()
-            }).eq('id', chapter_id).execute()
-            log_message(f"Updated chapter {display_number}")
-        else:
-            # Insert new chapter with normalized number
-            result = supabase.table('chapters').insert({
-                'manga_id': manga_id,
-                'chapter_number': db_chapter_number,
-                'title': chapter_title,
-                'total_panels': len(image_urls),
-                'published_at': datetime.now().isoformat(),
-                'created_at': datetime.now().isoformat()
-            }).execute()
-            chapter_id = result.data[0]['id']
-            log_message(f"Created new chapter {display_number}")
+        row = {
+            "title":          article["title"],
+            "publisher":      article.get("publisher") or None,
+            "published_at":   published_at,
+            "published_text": article.get("published") or None,  # raw ISO string as text backup
+            "google_link":    article.get("google_link") or None,
+            "article_url":    article["real_url"],
+            "image_url":      article.get("image") or None,
+            "query":          article.get("query") or None,
+            "scraped_at":     datetime.now(timezone.utc).isoformat(),
+            "created_at":     datetime.now(timezone.utc).isoformat(),
+            # expires_at is set automatically by trigger: set_news_article_expiry()
+        }
 
-        # Insert panels in batch
-        if image_urls:
-            panels_data = []
-            for idx, img_url in enumerate(image_urls, 1):
-                panels_data.append({
-                    'chapter_id': chapter_id,
-                    'panel_number': idx,
-                    'image_url': img_url,
-                    'created_at': datetime.now().isoformat()
-                })
-
-            supabase.table('panels').insert(panels_data).execute()
-            log_message(f"Saved {len(panels_data)} panels for chapter {display_number}")
-
+        supabase.table("news_articles").insert(row).execute()
         return True
 
     except Exception as e:
-        log_message(f"Error saving chapter: {e}", "ERROR")
+        err = str(e)
+        if "unique" in err.lower() or "duplicate" in err.lower() or "23505" in err:
+            log(f"  ↩  Skipped (duplicate): {article['title'][:60]}")
+        else:
+            log(f"  ✗  DB error for '{article['title'][:50]}': {err}", "ERROR")
         return False
 
 
-def update_manga_stats(manga_id):
-    """Update manga statistics"""
-    try:
-        chapters = supabase.table('chapters').select('total_panels').eq('manga_id', manga_id).execute()
+# ─────────────────────────────────────────────────────────────────────────────
+# SCRAPE ONE QUERY
+# ─────────────────────────────────────────────────────────────────────────────
+def scrape_query(driver, query, max_articles=50):
+    log("=" * 70)
+    log(f"Query: '{query}'")
+    log("=" * 70)
 
-        total_chapters = len(chapters.data)
-        total_panels = sum(ch.get('total_panels', 0) for ch in chapters.data)
+    url = (
+        f"https://news.google.com/search"
+        f"?q={requests.utils.quote(query)}&hl=en-US&gl=US&ceid=US%3Aen"
+    )
+    log(f"URL: {url}")
+    driver.get(url)
 
-        supabase.table('mangas').update({
-            'total_chapters': total_chapters,
-            'total_panels': total_panels,
-            'updated_at': datetime.now().isoformat()
-        }).eq('id', manga_id).execute()
+    if not wait_for_render(driver, timeout=30):
+        log("❌  Render timeout — skipping query", "ERROR")
+        return []
 
-        log_message(f"Updated manga stats: {total_chapters} chapters, {total_panels} panels")
+    scroll_page(driver, scrolls=5, pause=1.5)
 
-    except Exception as e:
-        log_message(f"Error updating manga stats: {e}", "WARNING")
+    link_els = driver.find_elements(By.CSS_SELECTOR, READY_SEL)
+    log(f"Found {len(link_els)} article links — processing up to {max_articles}")
 
+    # Pre-fetch existing URLs for this query to avoid redundant DB inserts
+    existing_urls = get_existing_urls(query)
+    log(f"Already in DB for this query: {len(existing_urls)}")
 
-def process_manga(manga):
-    """Process a single manga - check for new chapters and update"""
-    manga_id = manga['id']
-    manga_title = manga['title']
-    manga_slug = manga['slug']
+    articles = []
+    seen_titles = set()
 
-    log_message("=" * 70)
-    log_message(f"Processing: {manga_title} ({manga_slug})")
-    log_message("=" * 70)
+    for i, link_el in enumerate(link_els[:max_articles]):
+        try:
+            href = link_el.get_attribute("href") or ""
+            if not href:
+                continue
+            if not href.startswith("http"):
+                href = "https://news.google.com/" + href.lstrip("./")
 
-    try:
-        # Step 1: Get existing chapters from Supabase
-        existing_chapters = get_existing_chapters_from_supabase(manga_id)
-        log_message(f"Existing chapters in DB: {len(existing_chapters)}")
+            # Title
+            title = ""
+            for sel in ["h3", "h4"]:
+                try:
+                    title = link_el.find_element(By.CSS_SELECTOR, sel).text.strip()
+                    if title:
+                        break
+                except Exception:
+                    pass
+            if not title:
+                lines = (link_el.text or "").strip().splitlines()
+                title = next((l.strip() for l in lines if l.strip()), "")
 
-        # Step 2: Get available chapters from source
-        available_chapters = get_available_chapters_from_source(manga_slug)
+            if not title or title in seen_titles:
+                continue
+            seen_titles.add(title)
 
-        if not available_chapters:
-            log_message("No chapters found on source website", "WARNING")
-            return {
-                'manga': manga_title,
-                'status': 'failed',
-                'reason': 'No chapters found',
-                'new_chapters': 0,
-                'failed_chapters': 0
+            # Publisher
+            publisher = (
+                js_up_text(driver, link_el, "div.vr1PYe") or
+                js_up_text(driver, link_el, "a.wEwyrc") or
+                "Unknown"
+            )
+
+            # Time
+            published = (
+                js_up_attr(driver, link_el, "time.hvbAAd", "datetime") or
+                js_up_attr(driver, link_el, "time[datetime]", "datetime")
+            )
+
+            # Thumbnail from card
+            image = None
+            for img_sel in IMAGE_SEL:
+                image = js_up_image(driver, link_el, img_sel)
+                if image:
+                    if image.startswith("/"):
+                        image = "https://news.google.com" + image
+                    break
+
+            # Resolve real URL via Selenium tab
+            real_url = resolve_url_via_selenium(driver, href, timeout=8)
+            on_google = "google.com" in real_url
+
+            log(f"[{i+1:>3}] {title[:65]}")
+            log(f"       Publisher : {publisher}  |  Published : {published or 'N/A'}")
+            log(f"       URL       : {real_url[:70]}")
+            log(f"       Image     : {'✅' if image else '—'}")
+
+            # OG image fallback if no card thumbnail
+            if not image and not on_google:
+                image = extract_og_image(real_url)
+                if image:
+                    log(f"       Image(OG) : ✅")
+
+            # Skip if real URL still on Google (blocked redirect)
+            if on_google:
+                log(f"       ⚠  Redirect blocked — skipping save")
+                continue
+
+            # Skip if already in DB
+            if real_url in existing_urls:
+                log(f"       ↩  Already in DB — skipping")
+                continue
+
+            article = {
+                "title":       title,
+                "publisher":   publisher,
+                "published":   published,
+                "google_link": href,
+                "real_url":    real_url,
+                "image":       image,
+                "query":       query,
             }
+            articles.append(article)
+            log("")
 
-        # Step 3: Find missing chapters
-        missing_chapters = find_missing_chapters(existing_chapters, available_chapters)
+            time.sleep(random.uniform(0.3, 0.7))
 
-        if not missing_chapters:
-            log_message("✓ All chapters up to date!")
-            return {
-                'manga': manga_title,
-                'status': 'up_to_date',
-                'new_chapters': 0,
-                'failed_chapters': 0
-            }
+        except Exception as e:
+            log(f"⚠  [{i+1}]: {e}", "WARNING")
 
-        log_message(f"Found {len(missing_chapters)} new chapters to scrape")
-
-        # Step 4: Scrape and save missing chapters
-        success_count = 0
-        failed_count = 0
-
-        for idx, chapter in enumerate(missing_chapters, 1):
-            chapter_num = chapter['number']
-            chapter_url = chapter['url']
-            chapter_title = chapter['text']
-
-            log_message(f"[{idx}/{len(missing_chapters)}] Scraping chapter {format_chapter_number(chapter_num)}...")
-
-            try:
-                image_urls, success, error = scrape_chapter_images(chapter_url)
-
-                if success and image_urls:
-                    if save_chapter_to_supabase(manga_id, chapter_num, chapter_title, image_urls):
-                        success_count += 1
-                        log_message(f"✓ Chapter {format_chapter_number(chapter_num)} saved successfully")
-                    else:
-                        failed_count += 1
-                        log_message(f"✗ Failed to save chapter {format_chapter_number(chapter_num)}", "ERROR")
-                else:
-                    failed_count += 1
-                    log_message(f"✗ Failed to scrape chapter {format_chapter_number(chapter_num)}: {error}", "ERROR")
-
-                # Be polite to the server
-                time.sleep(2)
-
-            except Exception as e:
-                failed_count += 1
-                log_message(f"✗ Error processing chapter {format_chapter_number(chapter_num)}: {e}", "ERROR")
-
-        # Update manga statistics
-        update_manga_stats(manga_id)
-
-        log_message(f"✓ Completed: {success_count} new, {failed_count} failed")
-
-        return {
-            'manga': manga_title,
-            'status': 'updated',
-            'new_chapters': success_count,
-            'failed_chapters': failed_count
-        }
-
-    except Exception as e:
-        log_message(f"✗ Fatal error processing manga: {e}", "ERROR")
-        return {
-            'manga': manga_title,
-            'status': 'failed',
-            'reason': str(e),
-            'new_chapters': 0,
-            'failed_chapters': 0
-        }
+    return articles
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    """Main function - Auto update all mangas"""
-    log_message("=" * 70)
-    log_message("AUTO MANGA UPDATER - STARTING")
-    log_message("=" * 70)
-    log_message(f"Force Update: {FORCE_UPDATE}")
-    log_message("")
+    log("=" * 70)
+    log("GOOGLE NEWS SCRAPER → SUPABASE — STARTING")
+    log("=" * 70)
+    log(f"Queries: {SEARCH_QUERIES}")
+    log(f"Max articles per query: {MAX_ARTICLES_PER_QUERY}")
+    log("")
 
-    mangas = get_all_mangas_from_supabase()
+    driver = setup_driver()
 
-    if not mangas:
-        log_message("No mangas found in database", "ERROR")
-        sys.exit(1)
+    total_saved   = 0
+    total_skipped = 0
+    total_failed  = 0
 
-    log_message(f"Will process {len(mangas)} mangas")
-    log_message("")
+    try:
+        for q_idx, query in enumerate(SEARCH_QUERIES, 1):
+            log(f"\nQUERY {q_idx}/{len(SEARCH_QUERIES)}: '{query}'")
 
-    results = []
+            articles = scrape_query(driver, query, max_articles=MAX_ARTICLES_PER_QUERY)
 
-    for idx, manga in enumerate(mangas, 1):
-        log_message(f"\n{'=' * 70}")
-        log_message(f"MANGA {idx}/{len(mangas)}")
-        log_message(f"{'=' * 70}\n")
+            log(f"\nSaving {len(articles)} articles to Supabase...")
 
-        result = process_manga(manga)
-        results.append(result)
+            for article in articles:
+                if save_article_to_supabase(article):
+                    total_saved += 1
+                    log(f"  ✓  Saved: {article['title'][:65]}")
+                else:
+                    total_skipped += 1
 
-        if idx < len(mangas):
-            time.sleep(5)
+            # Pause between queries
+            if q_idx < len(SEARCH_QUERIES):
+                log("Waiting 5s before next query...")
+                time.sleep(5)
 
-    # Summary
-    log_message("\n" + "=" * 70)
-    log_message("UPDATE SUMMARY")
-    log_message("=" * 70)
+    finally:
+        driver.quit()
 
-    total_new    = sum(r['new_chapters']    for r in results)
-    total_failed = sum(r['failed_chapters'] for r in results)
-    up_to_date   = sum(1 for r in results if r['status'] == 'up_to_date')
-    updated      = sum(1 for r in results if r['status'] == 'updated')
-    failed       = sum(1 for r in results if r['status'] == 'failed')
-
-    log_message(f"Total Mangas Processed: {len(results)}")
-    log_message(f"  - Up to date: {up_to_date}")
-    log_message(f"  - Updated: {updated}")
-    log_message(f"  - Failed: {failed}")
-    log_message(f"\nTotal New Chapters Added: {total_new}")
-    log_message(f"Total Failed Chapters: {total_failed}")
-
-    if failed > 0:
-        log_message("\n✗ Failed Mangas:", "ERROR")
-        for r in results:
-            if r['status'] == 'failed':
-                reason = r.get('reason', 'Unknown error')
-                log_message(f"  - {r['manga']}: {reason}", "ERROR")
-
-    log_message("\n✓ Auto update completed!")
-    log_message("=" * 70)
+    # ── Summary ───────────────────────────────────────────────────────────
+    log("\n" + "=" * 70)
+    log("SUMMARY")
+    log("=" * 70)
+    log(f"Queries processed : {len(SEARCH_QUERIES)}")
+    log(f"Articles saved    : {total_saved}")
+    log(f"Skipped/duplicate : {total_skipped}")
+    log(f"Failed            : {total_failed}")
+    log("✓ Done!")
+    log("=" * 70)
 
 
 if __name__ == "__main__":
