@@ -23,27 +23,21 @@ jobs:
           chrome-version: stable
 
       - name: Install ChromeDriver
-        uses: nanasess/setup-chromedriver@v2   # ← ensures driver matches Chrome
-
-      - name: Cache Python dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-news-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-news-
+        uses: nanasess/setup-chromedriver@v2
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install --upgrade \
-            "selenium>=4.15,<5" \
+          pip cache purge
+          pip install --no-cache-dir --force-reinstall \
+            "selenium==4.18.1" \
             requests \
             beautifulsoup4 \
             "supabase>=2.0"
 
-      - name: Verify selenium install
-        run: python -c "from selenium.webdriver.by import By; print('Selenium OK')"
+      - name: Verify selenium
+        run: |
+          pip show selenium
+          python -c "from selenium.webdriver.by import By; print('Selenium OK')"
 
       - name: Run scraper
         env:
