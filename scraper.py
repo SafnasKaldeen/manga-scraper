@@ -1,8 +1,8 @@
 """
 Google News Scraper → Supabase
 Scrapes Google News for anime/manga queries and saves to news_articles table.
-Duplicates are skipped via article_url UNIQUE constraint.
-expires_at is set automatically by the Supabase trigger: set_news_article_expiry()
+Duplicates skipped via article_url UNIQUE constraint.
+expires_at set automatically by Supabase trigger: set_news_article_expiry()
 """
 
 import os
@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.webdriver.common.by import By
+from selenium.webdriver.by import By
 from selenium.webdriver.chrome.options import Options
 from supabase import create_client, Client
 
@@ -30,21 +30,19 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("✗ Error: SUPABASE_URL and SUPABASE_KEY environment variables must be set")
+    print("✗ Error: SUPABASE_URL and SUPABASE_KEY must be set", flush=True)
     sys.exit(1)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ── Queries to scrape — add/remove as needed ─────────────────────────────────
-SEARCH_QUERIES = [
-    "anime",
-    "manga",
-]
-
+SEARCH_QUERIES         = ["anime", "manga", "anime news"]
 MAX_ARTICLES_PER_QUERY = 50
 
 READY_SEL = "a.WwrzSb, a.JtKRv"
-IMAGE_SEL  = ["img.Quavad", "figure img.Quavad", "figure img"]
+IMAGE_SEL = ["img.Quavad", "figure img.Quavad", "figure img"]
+
+# How long to wait for a single URL redirect before giving up
+URL_RESOLVE_TIMEOUT = 4   # seconds — keep this short
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,7 +50,7 @@ IMAGE_SEL  = ["img.Quavad", "figure img.Quavad", "figure img"]
 # ─────────────────────────────────────────────────────────────────────────────
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}")
+    print(f"[{ts}] [{level}] {msg}", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +97,7 @@ def scroll_page(driver, scrolls=5, pause=1.5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JS DOM HELPERS — walk up ancestor tree to find elements
+# JS DOM HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def js_up_text(driver, el, sel):
     return driver.execute_script("""
@@ -148,15 +146,53 @@ def js_up_image(driver, el, sel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL RESOLUTION via new Selenium tab (avoids /sorry CAPTCHA from requests)
+# URL RESOLUTION
+# Strategy:
+#   1. Try requests first (fast, ~1s) — works for most sites
+#   2. Fall back to Selenium tab only if requests lands on Google
+#   3. Hard timeout of URL_RESOLVE_TIMEOUT on the Selenium tab
 # ─────────────────────────────────────────────────────────────────────────────
-def resolve_url_via_selenium(driver, google_url, timeout=8):
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://news.google.com/",
+})
+
+
+def resolve_url_fast(google_url):
+    """
+    Step 1: try requests — fast and works for ~70% of articles.
+    Returns the real URL, or None if it's still on Google.
+    """
+    try:
+        r = SESSION.get(google_url, allow_redirects=True, timeout=5)
+        url = r.url
+        if "google.com" not in url:
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def resolve_url_via_selenium(driver, google_url, timeout=URL_RESOLVE_TIMEOUT):
+    """
+    Step 2: open in a new Selenium tab — bypasses /sorry CAPTCHA.
+    Hard-capped at `timeout` seconds per article.
+    """
     original = driver.current_window_handle
     try:
         driver.execute_script("window.open('');")
         new_handle = [h for h in driver.window_handles if h != original][-1]
         driver.switch_to.window(new_handle)
-        driver.get(google_url)
+
+        # Set page load timeout so the tab never hangs forever
+        driver.set_page_load_timeout(timeout)
+
+        try:
+            driver.get(google_url)
+        except Exception:
+            pass  # timeout or nav error — check current URL anyway
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -164,43 +200,44 @@ def resolve_url_via_selenium(driver, google_url, timeout=8):
             if "google.com" not in current and "about:blank" not in current:
                 driver.close()
                 driver.switch_to.window(original)
+                driver.set_page_load_timeout(30)  # reset to default
                 return current
-            time.sleep(0.5)
+            time.sleep(0.3)
 
-        # Still on Google — try canonical link from page source
-        final_url = driver.current_url
-        try:
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            canon = soup.find("link", rel="canonical")
-            if canon and canon.get("href") and "google.com" not in canon["href"]:
-                final_url = canon["href"]
-        except Exception:
-            pass
-
+        # Timed out — return whatever URL we have
+        final = driver.current_url
         driver.close()
         driver.switch_to.window(original)
-        return final_url
+        driver.set_page_load_timeout(30)
+        return final if "google.com" not in final else google_url
 
-    except Exception:
+    except Exception as e:
+        log(f"  Tab error: {e}", "WARNING")
         try:
             driver.close()
             driver.switch_to.window(original)
+            driver.set_page_load_timeout(30)
         except Exception:
             pass
         return google_url
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OG IMAGE fallback — fetch from real article page
-# ─────────────────────────────────────────────────────────────────────────────
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0",
-    "Accept-Language": "en-US,en;q=0.9",
-})
+def resolve_url(driver, google_url):
+    """Try fast requests first, fall back to Selenium tab."""
+    # Fast path
+    url = resolve_url_fast(google_url)
+    if url:
+        return url, "fast"
+
+    # Slow path (Selenium tab)
+    url = resolve_url_via_selenium(driver, google_url, timeout=URL_RESOLVE_TIMEOUT)
+    return url, "tab"
 
 
-def extract_og_image(url, timeout=8):
+# ─────────────────────────────────────────────────────────────────────────────
+# OG IMAGE
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_og_image(url, timeout=5):
     if not url or "google.com" in url:
         return None
     try:
@@ -224,7 +261,6 @@ def extract_og_image(url, timeout=8):
 # SUPABASE
 # ─────────────────────────────────────────────────────────────────────────────
 def get_existing_urls(query):
-    """Fetch all article_urls already stored for this query to skip duplicates."""
     try:
         result = (
             supabase.table("news_articles")
@@ -239,28 +275,25 @@ def get_existing_urls(query):
 
 
 def save_article_to_supabase(article: dict) -> bool:
-    """Insert article — skips gracefully on duplicate article_url."""
     try:
         row = {
             "title":          article["title"],
             "publisher":      article.get("publisher") or None,
-            "published_at":   article.get("published") or None,   # ISO string → timestamptz
-            "published_text": article.get("published") or None,   # raw backup
+            "published_at":   article.get("published") or None,
+            "published_text": article.get("published") or None,
             "google_link":    article.get("google_link") or None,
             "article_url":    article["real_url"],
             "image_url":      article.get("image") or None,
             "query":          article.get("query") or None,
             "scraped_at":     datetime.now(timezone.utc).isoformat(),
             "created_at":     datetime.now(timezone.utc).isoformat(),
-            # expires_at → set by trigger set_news_article_expiry()
         }
         supabase.table("news_articles").insert(row).execute()
         return True
-
     except Exception as e:
         err = str(e)
         if "unique" in err.lower() or "duplicate" in err.lower() or "23505" in err:
-            log(f"  ↩  Duplicate skipped: {article['title'][:60]}")
+            log(f"  ↩  Duplicate: {article['title'][:60]}")
         else:
             log(f"  ✗  DB error: {err}", "ERROR")
         return False
@@ -321,20 +354,18 @@ def scrape_query(driver, query, max_articles=50):
                 continue
             seen_titles.add(title)
 
-            # Publisher
+            # Publisher & time
             publisher = (
                 js_up_text(driver, link_el, "div.vr1PYe") or
                 js_up_text(driver, link_el, "a.wEwyrc") or
                 "Unknown"
             )
-
-            # Published datetime
             published = (
                 js_up_attr(driver, link_el, "time.hvbAAd", "datetime") or
                 js_up_attr(driver, link_el, "time[datetime]", "datetime")
             )
 
-            # Thumbnail from card
+            # Thumbnail
             image = None
             for img_sel in IMAGE_SEL:
                 image = js_up_image(driver, link_el, img_sel)
@@ -343,13 +374,16 @@ def scrape_query(driver, query, max_articles=50):
                         image = "https://news.google.com" + image
                     break
 
-            # Resolve real URL via Selenium tab
-            real_url  = resolve_url_via_selenium(driver, href, timeout=8)
+            # Resolve URL — fast path first, Selenium fallback
+            log(f"[{i+1:>3}] Resolving: {title[:55]}...")
+            t0 = time.time()
+            real_url, method = resolve_url(driver, href)
+            elapsed = time.time() - t0
             on_google = "google.com" in real_url
 
-            log(f"[{i+1:>3}] {title[:65]}")
+            log(f"       Title     : {title[:65]}")
             log(f"       Publisher : {publisher}  |  Published : {published or 'N/A'}")
-            log(f"       URL       : {real_url[:70]}")
+            log(f"       URL ({method}, {elapsed:.1f}s): {real_url[:65]}")
             log(f"       Image     : {'✅' if image else '—'}")
 
             # OG image fallback
@@ -376,7 +410,6 @@ def scrape_query(driver, query, max_articles=50):
                 "query":       query,
             })
             log("")
-            time.sleep(random.uniform(0.3, 0.7))
 
         except Exception as e:
             log(f"⚠  [{i+1}]: {e}", "WARNING")
@@ -391,8 +424,9 @@ def main():
     log("=" * 70)
     log("GOOGLE NEWS SCRAPER → SUPABASE — STARTING")
     log("=" * 70)
-    log(f"Queries           : {SEARCH_QUERIES}")
-    log(f"Max per query     : {MAX_ARTICLES_PER_QUERY}")
+    log(f"Queries       : {SEARCH_QUERIES}")
+    log(f"Max per query : {MAX_ARTICLES_PER_QUERY}")
+    log(f"URL timeout   : {URL_RESOLVE_TIMEOUT}s per article")
     log("")
 
     driver        = setup_driver()
@@ -405,7 +439,7 @@ def main():
 
             articles = scrape_query(driver, query, max_articles=MAX_ARTICLES_PER_QUERY)
 
-            log(f"\nSaving {len(articles)} articles to Supabase...")
+            log(f"\nSaving {len(articles)} new articles to Supabase...")
             for article in articles:
                 if save_article_to_supabase(article):
                     total_saved += 1
