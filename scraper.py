@@ -54,7 +54,7 @@ def log(msg, level="INFO"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TITLE NORMALISATION — strips punctuation/case for reliable comparison
+# TITLE NORMALISATION
 # ─────────────────────────────────────────────────────────────────────────────
 def norm(title: str) -> str:
     """Lowercase + strip all non-alphanumeric chars for fuzzy-safe comparison."""
@@ -105,7 +105,7 @@ def scroll_page(driver, scrolls=5, pause=1.5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JS DOM HELPERS — walk up ancestor tree
+# JS DOM HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def js_up_text(driver, el, sel):
     return driver.execute_script("""
@@ -155,8 +155,6 @@ def js_up_image(driver, el, sel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # URL RESOLUTION
-# 1. requests fast path (~1s, no browser needed, works for ~70% of sites)
-# 2. Selenium tab fallback with hard page-load timeout
 # ─────────────────────────────────────────────────────────────────────────────
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -245,15 +243,9 @@ def extract_og_image(url, timeout=5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUPABASE — load ALL existing urls + titles once at startup
+# SUPABASE
 # ─────────────────────────────────────────────────────────────────────────────
 def load_existing_records():
-    """
-    Fetch every article_url and title from the DB at startup.
-    - existing_urls  → skip if same URL appears again (different query)
-    - existing_titles → skip if same story appears under a different URL
-    Paginates in batches of 1000 for large tables.
-    """
     existing_urls   = set()
     existing_titles = set()
     try:
@@ -311,10 +303,6 @@ def save_article_to_supabase(article: dict) -> bool:
 # SCRAPE ONE QUERY
 # ─────────────────────────────────────────────────────────────────────────────
 def scrape_query(driver, query, max_articles, existing_urls, existing_titles):
-    """
-    existing_urls and existing_titles are passed in (loaded once at startup)
-    and updated in-place as new articles are queued, so cross-query dedup works.
-    """
     log("=" * 70)
     log(f"Query: '{query}'")
     log("=" * 70)
@@ -361,7 +349,7 @@ def scrape_query(driver, query, max_articles, existing_urls, existing_titles):
             if not title:
                 continue
 
-            # ── TITLE DEDUP — check BEFORE resolving URL (saves time) ─────
+            # ── Title dedup ───────────────────────────────────────────────
             title_key = norm(title)
             if title_key in existing_titles:
                 log(f"[{i+1:>3}] ↩  Title already known: {title[:65]}")
@@ -408,14 +396,13 @@ def scrape_query(driver, query, max_articles, existing_urls, existing_titles):
                 log(f"       ⚠  Redirect blocked — skipping")
                 continue
 
-            # ── URL DEDUP ─────────────────────────────────────────────────
+            # ── URL dedup ─────────────────────────────────────────────────
             if real_url in existing_urls:
                 log(f"       ↩  URL already in DB — skipping")
-                # Still add title so we don't re-process it this run
                 existing_titles.add(title_key)
                 continue
 
-            # ── Accept — add to both sets immediately for cross-query dedup
+            # ── Accept ────────────────────────────────────────────────────
             existing_urls.add(real_url)
             existing_titles.add(title_key)
 
@@ -448,7 +435,6 @@ def main():
     log(f"URL timeout   : {URL_RESOLVE_TIMEOUT}s per article")
     log("")
 
-    # Load all known URLs + titles ONCE — shared across all queries this run
     existing_urls, existing_titles = load_existing_records()
 
     driver        = setup_driver()
@@ -461,7 +447,7 @@ def main():
 
             articles = scrape_query(
                 driver, query, MAX_ARTICLES_PER_QUERY,
-                existing_urls, existing_titles   # shared, updated in-place
+                existing_urls, existing_titles
             )
 
             log(f"\nSaving {len(articles)} new articles to Supabase...")
