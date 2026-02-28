@@ -1,11 +1,10 @@
 """
-Google News Scraper — fully working version
-Fixes:
-  1. Published time: search from the link element outward using JS closest()
-     instead of walking a fixed number of parent levels
-  2. Real URL: Google News /read/ URLs require a browser redirect or
-     decoding the base64 article ID — we use a session with full headers
-     and a longer timeout, plus fallback to Selenium for stubborn redirects
+Google News Scraper with Supabase ingestion
+- Scrapes Google News for given queries
+- Deduplicates by title (checks DB before insert)
+- Upserts on article_url conflict as a safety net
+- Maps fields to news_articles table schema
+- expires_at is handled automatically by the DB trigger set_news_article_expiry()
 """
 
 from selenium import webdriver
@@ -14,20 +13,136 @@ from selenium.webdriver.chrome.options import Options
 import time
 import requests
 from bs4 import BeautifulSoup
-import json
 import re
 import random
 import sys
-import base64
+import os
+from datetime import datetime, timezone
+
+from supabase import create_client, Client
 
 
-READY_SEL  = "a.WwrzSb, a.JtKRv"
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPABASE
+# ─────────────────────────────────────────────────────────────────────────────
+def get_supabase_client() -> Client:
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        raise EnvironmentError("SUPABASE_URL and SUPABASE_KEY must be set")
+    return create_client(url, key)
+
+
+def fetch_existing_titles(supabase: Client, titles: list[str]) -> set[str]:
+    """
+    Returns normalised (lowercased) titles that already exist in the DB.
+    Uses an 'in' filter — only checks the titles we are about to insert.
+    """
+    if not titles:
+        return set()
+    try:
+        response = (
+            supabase.table("news_articles")
+            .select("title")
+            .in_("title", titles)
+            .execute()
+        )
+        return {row["title"].strip().lower() for row in (response.data or [])}
+    except Exception as e:
+        print(f"⚠  Could not fetch existing titles from Supabase: {e}")
+        return set()
+
+
+def ingest_articles(supabase: Client, articles: list[dict], query: str) -> dict:
+    """
+    1. Title-based dedup against DB.
+    2. Upsert new rows (article_url conflict → ignore as a safety net).
+    Returns {"inserted": int, "skipped": int}.
+    """
+    if not articles:
+        return {"inserted": 0, "skipped": 0}
+
+    # ── Step 1: title dedup ───────────────────────────────────────────────
+    all_titles = [a["title"].strip() for a in articles]
+    existing   = fetch_existing_titles(supabase, all_titles)
+
+    new_articles = []
+    skipped = 0
+    for a in articles:
+        if a["title"].strip().lower() in existing:
+            print(f"  ⏭  Duplicate title — skipping: {a['title'][:72]}")
+            skipped += 1
+        else:
+            new_articles.append(a)
+
+    print(f"\n  📥  {len(new_articles)} new | {skipped} title-duplicates skipped\n")
+
+    if not new_articles:
+        return {"inserted": 0, "skipped": skipped}
+
+    # ── Step 2: build rows ────────────────────────────────────────────────
+    now  = datetime.now(timezone.utc).isoformat()
+    rows = []
+
+    for a in new_articles:
+        # Parse ISO datetime from Google News <time datetime="...">
+        published_at   = None
+        published_text = a.get("published")
+        if published_text:
+            try:
+                published_at = datetime.fromisoformat(
+                    published_text.replace("Z", "+00:00")
+                ).isoformat()
+            except ValueError:
+                pass  # keep published_text only, published_at stays None
+
+        # Prefer resolved real URL; fall back to google_link
+        article_url = a.get("real_url") or ""
+        if not article_url or "google.com" in article_url:
+            article_url = a.get("google_link", "")
+        if not article_url:
+            print(f"  ⚠  No usable URL — skipping: {a['title'][:72]}")
+            skipped += 1
+            continue
+
+        rows.append({
+            "title":          a["title"].strip(),
+            "publisher":      a.get("publisher") or None,
+            "published_at":   published_at,
+            "published_text": published_text or None,
+            "google_link":    a.get("google_link") or None,
+            "article_url":    article_url,
+            "image_url":      a.get("image") or None,
+            "query":          query,
+            "scraped_at":     now,
+            # expires_at: set automatically by DB trigger set_news_article_expiry()
+        })
+
+    if not rows:
+        return {"inserted": 0, "skipped": skipped}
+
+    # ── Step 3: upsert ────────────────────────────────────────────────────
+    try:
+        response = (
+            supabase.table("news_articles")
+            .upsert(rows, on_conflict="article_url", ignore_duplicates=True)
+            .execute()
+        )
+        inserted = len(response.data) if response.data else 0
+        print(f"  ✅  Inserted {inserted} rows into Supabase (news_articles)")
+        return {"inserted": inserted, "skipped": skipped}
+    except Exception as e:
+        print(f"  ❌  Supabase upsert failed: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELENIUM DRIVER
+# ─────────────────────────────────────────────────────────────────────────────
+READY_SEL = "a.WwrzSb, a.JtKRv"
 IMAGE_SEL  = ["img.Quavad", "figure img.Quavad", "figure img"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DRIVER
-# ─────────────────────────────────────────────────────────────────────────────
 def setup_driver():
     options = Options()
     options.add_argument("--headless=new")
@@ -51,15 +166,12 @@ def setup_driver():
     return driver
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# WAIT
-# ─────────────────────────────────────────────────────────────────────────────
 def wait_for_render(driver, timeout=30):
-    print(f"⏳  Waiting for render (up to {timeout}s)...")
+    print(f"  ⏳  Waiting for render (up to {timeout}s)...")
     deadline = time.time() + timeout
     while time.time() < deadline:
         if driver.find_elements(By.CSS_SELECTOR, READY_SEL):
-            print(f"✅  Page rendered")
+            print("  ✅  Page rendered")
             return True
         time.sleep(1)
     return False
@@ -72,13 +184,11 @@ def scroll_page(driver, scrolls=5, pause=1.5):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIND CARD CONTEXT via JS — walks up DOM until it finds the target selector
+# DOM HELPERS — walk up the DOM tree to find related elements
 # ─────────────────────────────────────────────────────────────────────────────
 def js_closest_text(driver, element, css_sel):
-    """Walk up from element, search each ancestor for css_sel, return text."""
     return driver.execute_script("""
-        var el = arguments[0];
-        var sel = arguments[1];
+        var el = arguments[0], sel = arguments[1];
         for (var i = 0; i < 10; i++) {
             el = el.parentElement;
             if (!el) return null;
@@ -90,11 +200,8 @@ def js_closest_text(driver, element, css_sel):
 
 
 def js_closest_attr(driver, element, css_sel, attr):
-    """Walk up from element, search each ancestor for css_sel, return attribute."""
     return driver.execute_script("""
-        var el = arguments[0];
-        var sel = arguments[1];
-        var attr = arguments[2];
+        var el = arguments[0], sel = arguments[1], attr = arguments[2];
         for (var i = 0; i < 10; i++) {
             el = el.parentElement;
             if (!el) return null;
@@ -106,10 +213,8 @@ def js_closest_attr(driver, element, css_sel, attr):
 
 
 def js_closest_src(driver, element, css_sel):
-    """Walk up from element, search for image, return best src from srcset or src."""
     return driver.execute_script("""
-        var el = arguments[0];
-        var sel = arguments[1];
+        var el = arguments[0], sel = arguments[1];
         for (var i = 0; i < 10; i++) {
             el = el.parentElement;
             if (!el) return null;
@@ -129,8 +234,6 @@ def js_closest_src(driver, element, css_sel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # URL RESOLUTION
-# Google News /read/ and /articles/ URLs redirect to real articles.
-# They require cookie consent headers — use a session with realistic headers.
 # ─────────────────────────────────────────────────────────────────────────────
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -138,36 +241,32 @@ SESSION.headers.update({
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://news.google.com/",
+    "Referer":         "https://news.google.com/",
 })
 
 
 def resolve_redirect(url, timeout=10):
-    """Follow redirects to get real article URL."""
     if not url or not url.startswith("http"):
         return url
     try:
-        r = SESSION.get(url, allow_redirects=True, timeout=timeout)
+        r     = SESSION.get(url, allow_redirects=True, timeout=timeout)
         final = r.url
-        # If still on Google domain, try parsing redirect from response body
         if "google.com" in final:
             soup = BeautifulSoup(r.text, "html.parser")
-            # Some Google News pages embed the real URL in a meta refresh or link
             meta = soup.find("meta", attrs={"http-equiv": "refresh"})
             if meta:
                 content = meta.get("content", "")
-                match = re.search(r'url=(.+)', content, re.IGNORECASE)
+                match   = re.search(r'url=(.+)', content, re.IGNORECASE)
                 if match:
                     return match.group(1).strip("'\" ")
-            # Try canonical link
             canon = soup.find("link", rel="canonical")
             if canon and canon.get("href") and "google.com" not in canon["href"]:
                 return canon["href"]
         return final
-    except Exception as e:
+    except Exception:
         return url
 
 
@@ -175,7 +274,7 @@ def extract_og_image(url, timeout=8):
     if not url or "google.com" in url:
         return None
     try:
-        r = SESSION.get(url, timeout=timeout, allow_redirects=True)
+        r    = SESSION.get(url, timeout=timeout, allow_redirects=True)
         soup = BeautifulSoup(r.text, "html.parser")
         for meta in [
             soup.find("meta", property="og:image"),
@@ -186,16 +285,16 @@ def extract_og_image(url, timeout=8):
                 img = meta.get("content", "")
                 if img and "gstatic.com" not in img and "google.com" not in img:
                     return img
-    except Exception as e:
+    except Exception:
         pass
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN
+# MAIN SCRAPER
 # ─────────────────────────────────────────────────────────────────────────────
-def scrape_google_news(query="anime", max_articles=50):
-    driver = setup_driver()
+def scrape_google_news(query="anime", max_articles=50) -> list[dict]:
+    driver  = setup_driver()
     results = []
 
     try:
@@ -203,19 +302,19 @@ def scrape_google_news(query="anime", max_articles=50):
             f"https://news.google.com/search"
             f"?q={requests.utils.quote(query)}&hl=en-US&gl=US&ceid=US%3Aen"
         )
-        print(f"🔎  {url}\n")
+        print(f"  🔎  {url}\n")
         driver.get(url)
 
         if not wait_for_render(driver, timeout=30):
-            print("❌  Render timeout.")
+            print("  ❌  Render timeout.")
             return results
 
         scroll_page(driver, scrolls=5, pause=1.5)
 
         link_els = driver.find_elements(By.CSS_SELECTOR, READY_SEL)
-        print(f"📰  {len(link_els)} links found — processing up to {max_articles}\n")
+        print(f"  📰  {len(link_els)} links found — processing up to {max_articles}\n")
 
-        seen = set()
+        seen_titles: set[str] = set()
 
         for i, link_el in enumerate(link_els[:max_articles]):
             try:
@@ -225,7 +324,7 @@ def scrape_google_news(query="anime", max_articles=50):
                 if not href.startswith("http"):
                     href = "https://news.google.com/" + href.lstrip("./")
 
-                # ── Title ────────────────────────────────────────────
+                # Title
                 title = ""
                 for sel in ["h3", "h4"]:
                     try:
@@ -238,25 +337,25 @@ def scrape_google_news(query="anime", max_articles=50):
                     lines = (link_el.text or "").strip().splitlines()
                     title = next((l.strip() for l in lines if l.strip()), "")
 
-                if not title or title in seen:
+                if not title or title.lower() in seen_titles:
                     continue
-                seen.add(title)
+                seen_titles.add(title.lower())
 
-                # ── Publisher — walk up DOM ───────────────────────────
+                # Publisher
                 publisher = (
                     js_closest_text(driver, link_el, "div.vr1PYe") or
-                    js_closest_text(driver, link_el, "a.wEwyrc") or
+                    js_closest_text(driver, link_el, "a.wEwyrc")   or
                     js_closest_text(driver, link_el, "div.CEMjEf span") or
                     "Unknown"
                 )
 
-                # ── Time — walk up DOM ────────────────────────────────
+                # Published datetime
                 published = (
-                    js_closest_attr(driver, link_el, "time.hvbAAd", "datetime") or
+                    js_closest_attr(driver, link_el, "time.hvbAAd",   "datetime") or
                     js_closest_attr(driver, link_el, "time[datetime]", "datetime")
                 )
 
-                # ── Image — walk up DOM ───────────────────────────────
+                # Image
                 image = None
                 for img_sel in IMAGE_SEL:
                     image = js_closest_src(driver, link_el, img_sel)
@@ -265,22 +364,18 @@ def scrape_google_news(query="anime", max_articles=50):
                             image = "https://news.google.com" + image
                         break
 
-                print(f"[{i+1:>3}] {title[:72]}")
-                print(f"       Publisher : {publisher}")
-                print(f"       Published : {published or 'N/A'}")
-                print(f"       Image     : {'✅  ' + image[:60] if image else '—'}")
+                print(f"  [{i+1:>3}] {title[:72]}")
+                print(f"         Publisher : {publisher}")
+                print(f"         Published : {published or 'N/A'}")
 
-                # ── Resolve real URL ──────────────────────────────────
-                real_url = resolve_redirect(href)
+                # Resolve real URL
+                real_url     = resolve_redirect(href)
                 still_google = "google.com" in real_url
-                print(f"       URL       : {real_url[:72]}")
-                if still_google:
-                    print(f"       ⚠  Still on Google — redirect blocked")
+                print(f"         URL       : {real_url[:72]}")
 
-                # ── OG image fallback ─────────────────────────────────
+                # OG image fallback
                 if not image and not still_google:
                     image = extract_og_image(real_url)
-                    print(f"       Image(OG) : {'✅' if image else '❌'}")
 
                 results.append({
                     "title":       title,
@@ -294,7 +389,7 @@ def scrape_google_news(query="anime", max_articles=50):
                 time.sleep(random.uniform(0.3, 0.8))
 
             except Exception as e:
-                print(f"⚠  [{i+1}]: {e}\n")
+                print(f"  ⚠  [{i+1}]: {e}\n")
 
     finally:
         driver.quit()
@@ -303,25 +398,31 @@ def scrape_google_news(query="anime", max_articles=50):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    query = sys.argv[1] if len(sys.argv) > 1 else "anime"
-    max_n = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+    # Accept query args from CLI: python scraper.py anime manga
+    # Defaults to both anime and manga if nothing passed
+    queries = sys.argv[1:] if len(sys.argv) > 1 else ["anime", "manga"]
+    max_n   = 50
 
-    articles = scrape_google_news(query, max_articles=max_n)
+    supabase = get_supabase_client()
 
-    print("\n" + "=" * 80)
-    print(f"📊  {len(articles)} articles scraped for '{query}'")
-    print("=" * 80 + "\n")
+    total_inserted = 0
+    total_skipped  = 0
 
-    for i, a in enumerate(articles, 1):
-        print(f"{i:>3}. {a['title']}")
-        print(f"      Publisher : {a['publisher']}")
-        print(f"      Published : {a['published'] or 'N/A'}")
-        print(f"      URL       : {a['real_url']}")
-        print(f"      Image     : {a['image'] or 'NO IMAGE'}")
-        print("-" * 80)
+    for query in queries:
+        print(f"\n{'='*80}")
+        print(f"🔍  Query: '{query}'")
+        print(f"{'='*80}\n")
 
-    out = f"results_{query.replace(' ', '_')}.json"
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(articles, f, indent=2, ensure_ascii=False)
-    print(f"\n💾  Saved → {out}")
+        articles = scrape_google_news(query=query, max_articles=max_n)
+        print(f"\n  📊  Scraped {len(articles)} articles for '{query}'")
+
+        counts          = ingest_articles(supabase, articles, query)
+        total_inserted += counts["inserted"]
+        total_skipped  += counts["skipped"]
+
+    print(f"\n{'='*80}")
+    print(f"🏁  All done — {total_inserted} inserted, {total_skipped} skipped")
+    print(f"{'='*80}\n")
