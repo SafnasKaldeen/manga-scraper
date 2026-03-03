@@ -150,25 +150,39 @@ def get_available_chapters_from_source(manga_slug):
 
         for link in links:
             href = link.get('href')
-            if href and '/chapter-' in href:
-                match = re.search(r'chapter-([\d]+(?:\.[\d]+|-[\d]+)?)', href)
-                if match:
-                    chapter_num_str = match.group(1).replace('-', '.')
-                    try:
-                        db_key = to_db_format(chapter_num_str)
-                        full_url = urljoin(manga_url, href)
-                        chapter_links.append({
-                            'url': full_url,
-                            'number': db_key,
-                            'text': link.get_text(strip=True)
-                        })
-                    except ValueError:
-                        continue
+            if not href or '/chapter-' not in href:
+                continue
 
-        # Remove duplicates keyed by db_format string
+            # FIX: match chapter number that is either:
+            #   - followed by end of string / slash / non-digit  → whole number (e.g. chapter-48-boom or chapter-48/)
+            #   - followed by a hyphen+digits then end/slash      → decimal (e.g. chapter-58-5/)
+            # This prevents "-boom" from being mistaken for a decimal part.
+            match = re.search(
+                r'chapter-((\d+)(?:-(\d+))?)'   # group 1 = full raw match, 2 = integer, 3 = optional decimal part
+                r'(?:/|-[a-zA-Z]|$)',            # must be followed by /, a letter-suffix, or end
+                href
+            )
+            if not match:
+                continue
+
+            integer_part  = match.group(2)
+            decimal_part  = match.group(3)  # None for whole chapters
+
+            chapter_num_str = f"{integer_part}.{decimal_part}" if decimal_part else integer_part
+
+            try:
+                db_key   = to_db_format(chapter_num_str)
+                full_url = urljoin(manga_url, href)
+                chapter_links.append({
+                    'url':    full_url,
+                    'number': db_key,
+                    'text':   link.get_text(strip=True)
+                })
+            except ValueError:
+                continue
+
         unique_chapters = {ch['number']: ch for ch in chapter_links}
         log_message(f"Found {len(unique_chapters)} unique chapters")
-
         return unique_chapters
 
     except Exception as e:
