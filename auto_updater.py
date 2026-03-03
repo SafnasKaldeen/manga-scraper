@@ -152,30 +152,24 @@ def get_available_chapters_from_source(manga_slug):
             href = link.get('href')
             if not href or '/chapter-' not in href:
                 continue
-        
-            # Extract the segment starting from 'chapter-'
-            # e.g. "chainsaw-man-chapter-48-boom-boom-boom/" → "chapter-48-boom-boom-boom/"
-            #      "one-punch-man/chapter-58-5/"             → "chapter-58-5/"
-            #      "manga/chapter-100/"                      → "chapter-100/"
-            chapter_segment = href[href.rfind('/chapter-') + 1:]  # everything from 'chapter-' onward
-        
-            # Now match from the start of that segment:
-            #   chapter-<integer>            → whole chapter
-            #   chapter-<integer>-<digits>/  → decimal chapter (e.g. chapter-58-5/)
-            #   chapter-<integer>-<letters>  → titled chapter (e.g. chapter-48-boom), treat as whole
-            match = re.match(
-                r'chapter-(\d+)'             # mandatory integer part
-                r'(?:-(\d+)(?=/|$))?',       # optional decimal ONLY if followed by / or end-of-string
-                chapter_segment
+
+            # FIX: match chapter number that is either:
+            #   - followed by end of string / slash / non-digit  → whole number (e.g. chapter-48-boom or chapter-48/)
+            #   - followed by a hyphen+digits then end/slash      → decimal (e.g. chapter-58-5/)
+            # This prevents "-boom" from being mistaken for a decimal part.
+            match = re.search(
+                r'chapter-((\d+)(?:-(\d+))?)'   # group 1 = full raw match, 2 = integer, 3 = optional decimal part
+                r'(?:/|-[a-zA-Z]|$)',            # must be followed by /, a letter-suffix, or end
+                href
             )
             if not match:
                 continue
-        
-            integer_part = match.group(1)
-            decimal_part = match.group(2)  # None unless it's a true decimal like chapter-58-5/
-        
+
+            integer_part  = match.group(2)
+            decimal_part  = match.group(3)  # None for whole chapters
+
             chapter_num_str = f"{integer_part}.{decimal_part}" if decimal_part else integer_part
-        
+
             try:
                 db_key   = to_db_format(chapter_num_str)
                 full_url = urljoin(manga_url, href)
